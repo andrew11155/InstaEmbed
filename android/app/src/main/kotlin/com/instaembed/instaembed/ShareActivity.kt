@@ -18,8 +18,6 @@ class ShareActivity : Activity() {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
     private val igAppId = "936619743392459"
 
-    private val filesToCleanup = mutableListOf<File>()
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -41,24 +39,22 @@ class ShareActivity : Activity() {
             } catch (e: Exception) {
                 handler.post {
                     toast("Error: ${e.message}")
-                    cleanupFiles(); finish()
+                    finish()
                 }
                 return@Thread
             }
-            handler.post { cleanupFiles(); finish() }
+            handler.post { finish() }
         }.start()
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        cleanupFiles()
-    }
-
-    private fun cleanupFiles() {
-        filesToCleanup.forEach { f ->
-            try { if (f.exists()) f.delete() } catch (_: Exception) {}
-        }
-        filesToCleanup.clear()
+    private fun cleanupOldFiles() {
+        try {
+            cacheDir.listFiles()?.forEach { f ->
+                if (f.name.startsWith("instaembed_") && f.name.endsWith(".mp4")) {
+                    f.delete()
+                }
+            }
+        } catch (_: Exception) {}
     }
 
     private fun extractShortcode(url: String): String? {
@@ -74,6 +70,9 @@ class ShareActivity : Activity() {
     }
 
     private fun processShare(shortcode: String) {
+        // Clean up old files from previous shares
+        cleanupOldFiles()
+
         // Get cookies
         val initConn = URL("https://www.instagram.com/").openConnection() as HttpURLConnection
         initConn.setRequestProperty("User-Agent", ua)
@@ -147,17 +146,15 @@ class ShareActivity : Activity() {
 
         handler.post { toast("Downloading...") }
 
-        val originalFile = File(cacheDir, "instaembed_$shortcode.mp4")
-        filesToCleanup.add(originalFile)
-        downloadFile(videoUrl, originalFile)
+        val file = File(cacheDir, "instaembed_$shortcode.mp4")
+        downloadFile(videoUrl, file)
 
-        val size = originalFile.length()
-        if (size > 8 * 1024 * 1024) {
-            val mb = "%.1f".format(size / (1024.0 * 1024.0))
-            handler.post { toast("Large file (${mb} MB) — may exceed Discord limit") }
-        }
+        val size = file.length()
+        val mb = "%.1f".format(size / (1024.0 * 1024.0))
+        handler.post { toast("Downloaded ${mb} MB — sharing...") }
 
-        handler.post { shareFile(originalFile) }
+        // Share the file — do NOT delete it until after the user has sent it
+        handler.post { shareFile(file) }
     }
 
     private fun downloadFile(urlStr: String, dest: File) {
@@ -166,6 +163,12 @@ class ShareActivity : Activity() {
         conn.connectTimeout = 30000
         conn.readTimeout = 30000
         conn.connect()
+
+        if (conn.responseCode != 200) {
+            conn.disconnect()
+            throw Exception("Download failed: HTTP ${conn.responseCode}")
+        }
+
         dest.outputStream().use { out -> conn.inputStream.use { it.copyTo(out) } }
         conn.disconnect()
     }
