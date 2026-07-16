@@ -152,36 +152,12 @@ class ShareActivity : Activity() {
         downloadFile(videoUrl, originalFile)
 
         val size = originalFile.length()
-        val readable = VideoCompressor.getReadableSize(size)
-
-        var fileToShare = originalFile
-
-        if (VideoCompressor.needsCompression(originalFile)) {
-            val compressedFile = File(cacheDir, "instaembed_${shortcode}_compressed.mp4")
-            filesToCleanup.add(compressedFile)
-            handler.post { toast("Compressing $readable...") }
-
-            try {
-                VideoCompressor.compress(originalFile, compressedFile) { pct ->
-                    if (pct == 100) {
-                        handler.post { toast("Finishing encoding...") }
-                    } else if (pct % 25 == 0) {
-                        handler.post { toast("Compressing... $pct%") }
-                    }
-                }
-                if (compressedFile.exists() && compressedFile.length() > 0) {
-                    val compressedReadable = VideoCompressor.getReadableSize(compressedFile.length())
-                    handler.post { toast("Compressed: $readable → $compressedReadable") }
-                    fileToShare = compressedFile
-                } else {
-                    handler.post { toast("Compression failed, sharing original") }
-                }
-            } catch (e: Exception) {
-                handler.post { toast("Compression failed, sharing original") }
-            }
+        if (size > 8 * 1024 * 1024) {
+            val mb = "%.1f".format(size / (1024.0 * 1024.0))
+            handler.post { toast("Large file (${mb} MB) — may exceed Discord limit") }
         }
 
-        handler.post { shareFile(fileToShare) }
+        handler.post { shareFile(originalFile) }
     }
 
     private fun downloadFile(urlStr: String, dest: File) {

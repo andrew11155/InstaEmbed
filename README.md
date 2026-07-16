@@ -26,7 +26,6 @@ Services like kkinstagram, ddinstagram, vxinstagram, and InstaFix that proxy Ins
 - **Flutter** — cross-platform UI (Android only for now)
 - **Native Kotlin** — Instagram API calls, video downloading, and sharing are handled entirely in native Android code for speed. The Flutter engine is only used for the manual URL input screen.
 - **Instagram GraphQL API** — fetches video URLs from public posts without authentication
-- **Android MediaCodec** — experimental video compression for files that exceed Discord's upload limits
 
 ## Current Status
 
@@ -38,11 +37,12 @@ This was a fun project built in a day to scratch a personal itch. Most of the co
 
 ### Known Issues
 
-- **Video compression is experimental** — the MediaCodec-based compressor can handle some videos but isn't reliable yet. Videos under 10MB (most reels) work fine without compression. Longer or higher-resolution videos may exceed Discord's file limit.
+- **No video compression yet** — videos over 10MB may exceed Discord's file upload limit (especially longer reels or high-resolution posts). Most reels are under 10MB and work fine. Compression via MediaCodec is planned but the transcoding pipeline needs more work to handle varying video formats reliably.
+- **Public posts only** — private/restricted accounts won't work
 
 ### Future Improvements
 
-- Fix video compression reliability
+- Video compression (re-encoding at lower bitrate/resolution for oversized files)
 - iOS support
 - Photo/carousel post support
 - Better error handling for private/restricted posts
