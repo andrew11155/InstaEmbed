@@ -11,8 +11,6 @@ import android.os.Looper
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.FileProvider
-import com.antonkarpenko.ffmpegkit.FFmpegKit
-import com.antonkarpenko.ffmpegkit.ReturnCode
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
@@ -296,19 +294,10 @@ class ShareActivity : Activity() {
     private fun compressVideo(input: File, shortcode: String): File? {
         try {
             val output = File(cacheDir, "instaembed_${shortcode}_compressed.mp4")
-
-            val session = FFmpegKit.execute(
-                "-y -i \"${input.path}\" " +
-                "-vf \"scale=-2:720\" " +
-                "-c:v libx264 -crf 28 -preset fast " +
-                "-c:a aac -b:a 64k " +
-                "\"${output.path}\""
-            )
-
-            if (ReturnCode.isSuccess(session.returnCode) && output.exists() && output.length() > 0) {
+            val success = VideoCompressor.compress(input, output)
+            if (success && output.exists() && output.length() > 0) {
                 return output
             }
-
             output.delete()
             return null
         } catch (e: Exception) {

@@ -40,10 +40,6 @@ kotlin {
     }
 }
 
-dependencies {
-    implementation("com.antonkarpenko:ffmpeg-kit-min-gpl:2.2.0")
-}
-
 flutter {
     source = "../.."
 }
