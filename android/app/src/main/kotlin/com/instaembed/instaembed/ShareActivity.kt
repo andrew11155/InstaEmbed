@@ -1,60 +1,320 @@
 package com.instaembed.instaembed
 
 import android.app.Activity
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.widget.Toast
+import android.util.Log
+import androidx.core.app.NotificationCompat
+import androidx.core.content.FileProvider
+import com.antonkarpenko.ffmpegkit.FFmpegKit
+import com.antonkarpenko.ffmpegkit.ReturnCode
+import org.json.JSONObject
 import java.io.File
+import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
-import org.json.JSONObject
+import java.net.URLEncoder
 
 class ShareActivity : Activity() {
 
+    private val TAG = "InstaEmbed"
+    private val CHANNEL_ID = "instaembed_progress"
+    private val NOTIFICATION_ID = 1001
     private val handler = Handler(Looper.getMainLooper())
-    private val ua =
+    private var shareLaunched = false
+    private var pendingCleanupFiles = mutableListOf<File>()
+
+    private val USER_AGENT =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-    private val igAppId = "936619743392459"
+    private val IG_APP_ID = "936619743392459"
+    private val GRAPHQL_ENDPOINT = "https://www.instagram.com/graphql/query/"
+    private val DOC_ID = "27128499623469141"
+    private val DISCORD_FREE_LIMIT = 10L * 1024 * 1024
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val text = intent?.getStringExtra(Intent.EXTRA_TEXT)
-        if (text == null) {
-            finish(); return
+        val text = intent?.getStringExtra(Intent.EXTRA_TEXT) ?: run {
+            finish()
+            return
         }
 
         val shortcode = extractShortcode(text)
         if (shortcode == null) {
-            toast("No Instagram URL found"); finish(); return
+            finish()
+            return
         }
 
-        toast("Fetching video...")
+        if (checkSelfPermission("android.permission.POST_NOTIFICATIONS") == PackageManager.PERMISSION_GRANTED) {
+            createNotificationChannel()
+            showNotification("Preparing video...")
+        }
 
-        Thread {
-            try {
-                processShare(shortcode)
-            } catch (e: Exception) {
-                handler.post {
-                    toast("Error: ${e.message}")
-                    finish()
-                }
-                return@Thread
-            }
-            handler.post { finish() }
-        }.start()
+        Thread { processShare(text, shortcode) }.start()
     }
 
-    private fun cleanupOldFiles() {
+    override fun onResume() {
+        super.onResume()
+        if (shareLaunched) {
+            shareLaunched = false
+            handler.postDelayed({
+                for (f in pendingCleanupFiles) f.delete()
+                pendingCleanupFiles.clear()
+                finish()
+            }, 10000)
+        }
+    }
+
+    private fun processShare(url: String, shortcode: String) {
         try {
-            cacheDir.listFiles()?.forEach { f ->
-                if (f.name.startsWith("instaembed_") && f.name.endsWith(".mp4")) {
-                    f.delete()
+            updateNotification("Fetching post data...")
+
+            val csrfToken = fetchCsrfToken()
+            val postData = fetchGraphQL(shortcode, csrfToken)
+            if (postData == null) {
+                Log.e(TAG, "GraphQL returned null")
+                cleanupAndFinish()
+                return
+            }
+
+            val mediaUrl = postData.first
+            val isVideo = postData.second
+
+            updateNotification("Downloading video...")
+            val tempFile = downloadFile(mediaUrl, shortcode)
+            if (tempFile == null) {
+                Log.e(TAG, "Download returned null")
+                cleanupAndFinish()
+                return
+            }
+
+            Log.i(TAG, "Downloaded ${tempFile.length()} bytes to ${tempFile.path}")
+
+            var fileToShare = tempFile
+            if (isVideo && tempFile.length() > DISCORD_FREE_LIMIT) {
+                updateNotification("Compressing video...")
+                val compressed = compressVideo(tempFile, shortcode)
+                if (compressed != null && compressed.length() < tempFile.length()) {
+                    fileToShare = compressed
+                    Log.i(TAG, "Compressed to ${compressed.length()} bytes")
                 }
             }
+
+            val mimeType = if (isVideo) "video/mp4" else "image/jpeg"
+            val uri = FileProvider.getUriForFile(
+                this,
+                "${packageName}.fileprovider",
+                fileToShare
+            )
+            Log.i(TAG, "Sharing URI: $uri, mimeType: $mimeType, size: ${fileToShare.length()}")
+
+            val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                type = mimeType
+                putExtra(Intent.EXTRA_STREAM, uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+
+            dismissNotification()
+
+            pendingCleanupFiles.add(tempFile)
+            if (fileToShare != tempFile) pendingCleanupFiles.add(fileToShare)
+
+            shareLaunched = true
+            startActivity(Intent.createChooser(shareIntent, null))
+
+        } catch (e: Exception) {
+            Log.e(TAG, "processShare failed: ${e.message}", e)
+            cleanupAndFinish()
+        }
+    }
+
+    private fun cleanupAndFinish() {
+        dismissNotification()
+        handler.post { finish() }
+    }
+
+    private fun createNotificationChannel() {
+        val channel = NotificationChannel(
+            CHANNEL_ID,
+            "InstaEmbed",
+            NotificationManager.IMPORTANCE_LOW
+        ).apply {
+            description = "Video processing progress"
+            setShowBadge(false)
+        }
+        val nm = getSystemService(NotificationManager::class.java)
+        nm.createNotificationChannel(channel)
+    }
+
+    private fun showNotification(text: String) {
+        try {
+            val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.stat_sys_download)
+                .setContentTitle("InstaEmbed")
+                .setContentText(text)
+                .setOngoing(true)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .build()
+            val nm = getSystemService(NotificationManager::class.java)
+            nm.notify(NOTIFICATION_ID, notification)
         } catch (_: Exception) {}
+    }
+
+    private fun updateNotification(text: String) {
+        try {
+            val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.stat_sys_download)
+                .setContentTitle("InstaEmbed")
+                .setContentText(text)
+                .setOngoing(true)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .build()
+            val nm = getSystemService(NotificationManager::class.java)
+            nm.notify(NOTIFICATION_ID, notification)
+        } catch (_: Exception) {}
+    }
+
+    private fun dismissNotification() {
+        try {
+            val nm = getSystemService(NotificationManager::class.java)
+            nm.cancel(NOTIFICATION_ID)
+        } catch (_: Exception) {}
+    }
+
+    private fun fetchCsrfToken(): String? {
+        try {
+            val conn = URL("https://www.instagram.com/").openConnection() as HttpURLConnection
+            conn.setRequestProperty("User-Agent", USER_AGENT)
+            conn.connectTimeout = 10000
+            conn.readTimeout = 10000
+            conn.connect()
+
+            val cookieHeader = conn.headerFields
+                .filter { it.key?.equals("Set-Cookie", ignoreCase = true) == true }
+                .flatMap { it.value }
+
+            for (cookie in cookieHeader) {
+                val match = Regex("csrftoken=([^;]+)").find(cookie)
+                if (match != null) return match.groupValues[1]
+            }
+            return null
+        } catch (e: Exception) {
+            Log.e(TAG, "fetchCsrfToken failed: ${e.message}")
+            return null
+        }
+    }
+
+    private fun fetchGraphQL(shortcode: String, csrfToken: String?): Pair<String, Boolean>? {
+        try {
+            val variables = JSONObject().apply {
+                put("shortcode", shortcode)
+                put("__relay_internal__pv__PolarisAIGMMediaWebLabelEnabledrelayprovider", false)
+            }
+
+            val body = "doc_id=$DOC_ID&variables=${URLEncoder.encode(variables.toString(), "UTF-8")}"
+
+            val conn = URL(GRAPHQL_ENDPOINT).openConnection() as HttpURLConnection
+            conn.requestMethod = "POST"
+            conn.setRequestProperty("User-Agent", USER_AGENT)
+            conn.setRequestProperty("X-IG-App-ID", IG_APP_ID)
+            conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
+            if (csrfToken != null) conn.setRequestProperty("X-CSRFToken", csrfToken)
+            conn.doOutput = true
+            conn.connectTimeout = 15000
+            conn.readTimeout = 15000
+
+            conn.outputStream.use { it.write(body.toByteArray()) }
+
+            if (conn.responseCode != 200) {
+                Log.e(TAG, "GraphQL returned ${conn.responseCode}")
+                return null
+            }
+
+            val response = conn.inputStream.bufferedReader().use { it.readText() }
+            val json = JSONObject(response)
+            val items = json
+                .getJSONObject("data")
+                .getJSONObject("xdt_api__v1__media__shortcode__web_info")
+                .getJSONArray("items")
+
+            if (items.length() == 0) return null
+
+            val item = items.getJSONObject(0)
+
+            val videoVersions = item.optJSONArray("video_versions")
+            if (videoVersions != null && videoVersions.length() > 0) {
+                val videoUrl = videoVersions.getJSONObject(0).getString("url")
+                return Pair(videoUrl, true)
+            }
+
+            val imageVersions = item.optJSONObject("image_versions2")
+            if (imageVersions != null) {
+                val candidates = imageVersions.optJSONArray("candidates")
+                if (candidates != null && candidates.length() > 0) {
+                    val imageUrl = candidates.getJSONObject(0).getString("url")
+                    return Pair(imageUrl, false)
+                }
+            }
+
+            return null
+        } catch (e: Exception) {
+            Log.e(TAG, "fetchGraphQL failed: ${e.message}")
+            return null
+        }
+    }
+
+    private fun downloadFile(url: String, shortcode: String): File? {
+        try {
+            val conn = URL(url).openConnection() as HttpURLConnection
+            conn.setRequestProperty("User-Agent", USER_AGENT)
+            conn.connectTimeout = 15000
+            conn.readTimeout = 30000
+
+            if (conn.responseCode != 200) {
+                Log.e(TAG, "Download returned ${conn.responseCode}")
+                return null
+            }
+
+            val file = File(cacheDir, "instaembed_$shortcode.mp4")
+            conn.inputStream.use { input ->
+                FileOutputStream(file).use { output ->
+                    input.copyTo(output)
+                }
+            }
+            return file
+        } catch (e: Exception) {
+            Log.e(TAG, "downloadFile failed: ${e.message}")
+            return null
+        }
+    }
+
+    private fun compressVideo(input: File, shortcode: String): File? {
+        try {
+            val output = File(cacheDir, "instaembed_${shortcode}_compressed.mp4")
+
+            val session = FFmpegKit.execute(
+                "-y -i \"${input.path}\" " +
+                "-vf \"scale=-2:720\" " +
+                "-c:v libx264 -crf 28 -preset fast " +
+                "-c:a aac -b:a 64k " +
+                "\"${output.path}\""
+            )
+
+            if (ReturnCode.isSuccess(session.returnCode) && output.exists() && output.length() > 0) {
+                return output
+            }
+
+            output.delete()
+            return null
+        } catch (e: Exception) {
+            Log.e(TAG, "compressVideo failed: ${e.message}")
+            return null
+        }
     }
 
     private fun extractShortcode(url: String): String? {
@@ -67,127 +327,5 @@ class ShareActivity : Activity() {
             if (m != null) return m.groupValues[1]
         }
         return null
-    }
-
-    private fun processShare(shortcode: String) {
-        // Clean up old files from previous shares
-        cleanupOldFiles()
-
-        // Get cookies
-        val initConn = URL("https://www.instagram.com/").openConnection() as HttpURLConnection
-        initConn.setRequestProperty("User-Agent", ua)
-        initConn.setRequestProperty("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-        initConn.connectTimeout = 10000
-        initConn.readTimeout = 10000
-        initConn.instanceFollowRedirects = true
-        initConn.connect()
-
-        val allCookies = mutableListOf<String>()
-        initConn.headerFields.forEach { (key, values) ->
-            if (key != null && key.equals("Set-Cookie", ignoreCase = true)) {
-                values?.forEach { allCookies.add(it.split(";").first()) }
-            }
-        }
-        initConn.disconnect()
-
-        val csrfToken = allCookies
-            .firstOrNull { it.startsWith("csrftoken=") }
-            ?.substringAfter("=") ?: throw Exception("No CSRF token")
-
-        val cookieHeader = allCookies.joinToString("; ")
-
-        handler.post { toast("Fetching post...") }
-
-        val variables = JSONObject().apply {
-            put("shortcode", shortcode)
-            put("__relay_internal__pv__PolarisAIGMMediaWebLabelEnabledrelayprovider", false)
-        }.toString()
-
-        val conn = URL("https://www.instagram.com/graphql/query/").openConnection() as HttpURLConnection
-        conn.requestMethod = "POST"
-        conn.doOutput = true
-        conn.setRequestProperty("User-Agent", ua)
-        conn.setRequestProperty("X-IG-App-ID", igAppId)
-        conn.setRequestProperty("X-CSRFToken", csrfToken)
-        conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
-        conn.setRequestProperty("Cookie", cookieHeader)
-        conn.setRequestProperty("Referer", "https://www.instagram.com/")
-        conn.setRequestProperty("Origin", "https://www.instagram.com")
-        conn.connectTimeout = 15000
-        conn.readTimeout = 15000
-
-        val body = "doc_id=27128499623469141&variables=${java.net.URLEncoder.encode(variables, "UTF-8")}"
-        conn.outputStream.buffered().use { it.write(body.toByteArray()) }
-
-        val code = conn.responseCode
-        val responseText = if (code == 200) {
-            conn.inputStream.bufferedReader().use { it.readText() }
-        } else {
-            val err = conn.errorStream?.bufferedReader()?.use { it.readText() } ?: "no body"
-            conn.disconnect()
-            throw Exception("API $code: ${err.take(200)}")
-        }
-        conn.disconnect()
-
-        val json = JSONObject(responseText)
-        val items = json
-            .optJSONObject("data")
-            ?.optJSONObject("xdt_api__v1__media__shortcode__web_info")
-            ?.optJSONArray("items")
-        if (items == null || items.length() == 0) throw Exception("No items in response")
-
-        val item = items.getJSONObject(0)
-        val videos = item.optJSONArray("video_versions")
-        var videoUrl: String? = null
-        if (videos != null && videos.length() > 0) {
-            videoUrl = videos.getJSONObject(0).optString("url")
-        }
-        if (videoUrl == null) throw Exception("No video URL")
-
-        handler.post { toast("Downloading...") }
-
-        val file = File(cacheDir, "instaembed_$shortcode.mp4")
-        downloadFile(videoUrl, file)
-
-        val size = file.length()
-        val mb = "%.1f".format(size / (1024.0 * 1024.0))
-        handler.post { toast("Downloaded ${mb} MB — sharing...") }
-
-        // Share the file — do NOT delete it until after the user has sent it
-        handler.post { shareFile(file) }
-    }
-
-    private fun downloadFile(urlStr: String, dest: File) {
-        val conn = URL(urlStr).openConnection() as HttpURLConnection
-        conn.setRequestProperty("User-Agent", ua)
-        conn.connectTimeout = 30000
-        conn.readTimeout = 30000
-        conn.connect()
-
-        if (conn.responseCode != 200) {
-            conn.disconnect()
-            throw Exception("Download failed: HTTP ${conn.responseCode}")
-        }
-
-        dest.outputStream().use { out -> conn.inputStream.use { it.copyTo(out) } }
-        conn.disconnect()
-    }
-
-    private fun shareFile(file: File) {
-        val uri = androidx.core.content.FileProvider.getUriForFile(
-            this,
-            "${packageName}.fileprovider",
-            file
-        )
-        val shareIntent = Intent(Intent.ACTION_SEND).apply {
-            type = "video/mp4"
-            putExtra(Intent.EXTRA_STREAM, uri)
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
-        startActivity(Intent.createChooser(shareIntent, null))
-    }
-
-    private fun toast(msg: String) {
-        Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
     }
 }

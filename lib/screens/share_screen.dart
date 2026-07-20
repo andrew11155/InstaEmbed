@@ -1,7 +1,6 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:share_plus/share_plus.dart';
-import 'package:path/path.dart' as p;
 import '../models/post_data.dart';
 import '../services/instagram_fetcher.dart';
 import '../services/video_downloader.dart';
@@ -192,7 +191,7 @@ class _ShareScreenState extends State<ShareScreen> {
               Icon(Icons.attach_file, color: Colors.grey[500], size: 18),
               const SizedBox(width: 4),
               Text(VideoDownloader.formatFileSize(fileSize)),
-              const SizedBox(width: 8),
+              const SizedBox(height: 8),
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
                 decoration: BoxDecoration(
