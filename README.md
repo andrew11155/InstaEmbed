@@ -34,15 +34,14 @@ This was a fun project built in a day to scratch a personal itch. Most of the co
 - Sharing Instagram reels/videos to Discord via the system share sheet
 - Headless mode — share from Instagram and never see the app UI
 - Temp file auto-cleanup after sharing
+- On-device video compression (MediaCodec) for files over Discord's free upload limit (20MB)
+- Self-updating — checks GitHub Releases in the background and prompts to install new versions
 
 ### Known Issues
 
-- **No video compression yet** — videos over 10MB may exceed Discord's file upload limit (especially longer reels or high-resolution posts). Most reels are under 10MB and work fine. Compression via MediaCodec is planned but the transcoding pipeline needs more work to handle varying video formats reliably.
 - **Public posts only** — private/restricted accounts won't work
 
 ### Future Improvements
-
-- Video compression (re-encoding at lower bitrate/resolution for oversized files)
 - iOS support
 - Photo/carousel post support
 - Better error handling for private/restricted posts
@@ -58,6 +57,12 @@ Requires:
 - Flutter SDK 3.44+
 - Android SDK 36+ (compileSdk 37)
 - Min SDK 26 (Android 8.0+)
+
+## Updates
+
+InstaEmbed checks `github.com/andrew11155/InstaEmbed`'s latest release in the background (at most once every 12 hours — on app open and after each share) and compares it against the installed `versionName`. If a newer tag has an `.apk` asset attached, it shows a notification; tapping it downloads the APK and hands it to the system installer. Since the app isn't distributed through the Play Store, Android still requires the user to approve installing it once ("Install unknown apps" for InstaEmbed) — this can't be skipped.
+
+**When cutting a release:** bump `version:` in `pubspec.yaml` to match the git tag (e.g. `1.3.0+4` for tag `v1.3.0`) *before* building the release APK, and attach the built `.apk` as a release asset. If the embedded version and the tag drift, update detection breaks.
 
 ## License
 

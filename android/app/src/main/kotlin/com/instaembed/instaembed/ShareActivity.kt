@@ -32,7 +32,7 @@ class ShareActivity : Activity() {
     private val IG_APP_ID = "936619743392459"
     private val GRAPHQL_ENDPOINT = "https://www.instagram.com/graphql/query/"
     private val DOC_ID = "27128499623469141"
-    private val DISCORD_FREE_LIMIT = 10L * 1024 * 1024
+    private val DISCORD_FREE_LIMIT = 20L * 1024 * 1024
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -53,6 +53,7 @@ class ShareActivity : Activity() {
             showNotification("Preparing video...")
         }
 
+        UpdateManager.checkForUpdateAsync(this)
         Thread { processShare(text, shortcode) }.start()
     }
 

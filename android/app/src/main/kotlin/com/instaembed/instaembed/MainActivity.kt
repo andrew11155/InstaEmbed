@@ -14,5 +14,6 @@ class MainActivity : FlutterActivity() {
                 ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
             }
         }
+        UpdateManager.checkForUpdateAsync(this)
     }
 }
