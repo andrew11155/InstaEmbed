@@ -11,8 +11,14 @@ import java.io.File
 object VideoCompressor {
     private const val TAG = "VideoCompressor"
     private const val TIMEOUT_US = 10_000L
+    private const val AUDIO_BIT_RATE = 64_000
+    private const val MIN_VIDEO_BIT_RATE = 300_000
+    private const val MAX_VIDEO_BIT_RATE = 6_000_000
+    // Leave headroom for the MP4 container/moov overhead so the muxed file
+    // lands under the target instead of just over it.
+    private const val SIZE_SAFETY_MARGIN = 0.92
 
-    fun compress(input: File, output: File): Boolean {
+    fun compress(input: File, output: File, targetSizeBytes: Long): Boolean {
         val extractor = MediaExtractor()
         try {
             extractor.setDataSource(input.path)
@@ -49,7 +55,34 @@ object VideoCompressor {
 
         val inputW = videoFormat.getInteger(MediaFormat.KEY_WIDTH)
         val inputH = videoFormat.getInteger(MediaFormat.KEY_HEIGHT)
-        val (outW, outH) = calcSize(inputW, inputH, 1280, 720)
+
+        val durationUs = if (videoFormat.containsKey(MediaFormat.KEY_DURATION)) {
+            videoFormat.getLong(MediaFormat.KEY_DURATION)
+        } else 0L
+        val durationSec = (durationUs / 1_000_000.0).coerceAtLeast(1.0)
+        val hasAudio = audioTrackIdx != -1 && audioFormat != null
+        val audioBitRate = if (hasAudio) AUDIO_BIT_RATE else 0
+
+        val videoBitRate = if (durationUs > 0) {
+            val budgetBits = targetSizeBytes * 8 * SIZE_SAFETY_MARGIN
+            ((budgetBits / durationSec) - audioBitRate).toInt()
+                .coerceIn(MIN_VIDEO_BIT_RATE, MAX_VIDEO_BIT_RATE)
+        } else {
+            2_000_000
+        }
+
+        // Low bitrates look blocky at higher resolutions, so scale the
+        // resolution cap down as the available bitrate shrinks (longer
+        // videos squeezed into the same size budget).
+        val maxDimensions = when {
+            videoBitRate < 800_000 -> Pair(854, 480)
+            videoBitRate < 1_500_000 -> Pair(1280, 720)
+            else -> Pair(1920, 1080)
+        }
+        val (outW, outH) = calcSize(inputW, inputH, maxDimensions.first, maxDimensions.second)
+
+        Log.i(TAG, "Compressing: ${durationSec}s, target=${targetSizeBytes}B, " +
+            "videoBitRate=$videoBitRate, resolution=${outW}x$outH")
 
         val muxer = MediaMuxer(output.path, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
         var muxerVideoTrack = -1
@@ -61,7 +94,7 @@ object VideoCompressor {
 
         try {
             val encFormat = MediaFormat.createVideoFormat("video/avc", outW, outH).apply {
-                setInteger(MediaFormat.KEY_BIT_RATE, 2_000_000)
+                setInteger(MediaFormat.KEY_BIT_RATE, videoBitRate)
                 setInteger(MediaFormat.KEY_FRAME_RATE, 30)
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
                 setInteger(MediaFormat.KEY_COLOR_FORMAT,
@@ -122,7 +155,7 @@ object VideoCompressor {
                                     audioFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE),
                                     audioFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
                                 ).apply {
-                                    setInteger(MediaFormat.KEY_BIT_RATE, 64_000)
+                                    setInteger(MediaFormat.KEY_BIT_RATE, AUDIO_BIT_RATE)
                                     setInteger(MediaFormat.KEY_AAC_PROFILE,
                                         MediaCodecInfo.CodecProfileLevel.AACObjectLC)
                                 }
@@ -188,7 +221,7 @@ object VideoCompressor {
         val channels = inputFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
 
         val encFormat = MediaFormat.createAudioFormat("audio/mp4a-latm", sampleRate, channels).apply {
-            setInteger(MediaFormat.KEY_BIT_RATE, 64_000)
+            setInteger(MediaFormat.KEY_BIT_RATE, AUDIO_BIT_RATE)
             setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
         }
 

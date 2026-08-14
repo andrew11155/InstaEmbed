@@ -295,7 +295,7 @@ class ShareActivity : Activity() {
     private fun compressVideo(input: File, shortcode: String): File? {
         try {
             val output = File(cacheDir, "instaembed_${shortcode}_compressed.mp4")
-            val success = VideoCompressor.compress(input, output)
+            val success = VideoCompressor.compress(input, output, DISCORD_FREE_LIMIT)
             if (success && output.exists() && output.length() > 0) {
                 return output
             }
