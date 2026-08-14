@@ -23,55 +23,66 @@ object UpdateManager {
     private const val PREF_LAST_CHECK = "last_check_ms"
     private const val CHECK_INTERVAL_MS = 12L * 60 * 60 * 1000
 
+    data class UpdateInfo(val version: String, val apkUrl: String)
+
+    /** Throttled background check, safe to call on every app open / share. */
     fun checkForUpdateAsync(context: Context) {
         val appContext = context.applicationContext
         val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val lastCheck = prefs.getLong(PREF_LAST_CHECK, 0)
         if (System.currentTimeMillis() - lastCheck < CHECK_INTERVAL_MS) return
-        prefs.edit().putLong(PREF_LAST_CHECK, System.currentTimeMillis()).apply()
 
         Thread {
-            try {
-                val conn = URL(API_URL).openConnection() as HttpURLConnection
-                conn.setRequestProperty("Accept", "application/vnd.github+json")
-                conn.connectTimeout = 10000
-                conn.readTimeout = 10000
-
-                if (conn.responseCode != 200) {
-                    Log.i(TAG, "Update check returned ${conn.responseCode}")
-                    return@Thread
-                }
-
-                val body = conn.inputStream.bufferedReader().use { it.readText() }
-                val json = JSONObject(body)
-                val tagName = json.optString("tag_name", "").removePrefix("v")
-                if (tagName.isEmpty()) return@Thread
-
-                val currentVersion = appContext.packageManager
-                    .getPackageInfo(appContext.packageName, 0).versionName ?: return@Thread
-
-                if (!isNewer(tagName, currentVersion)) return@Thread
-
-                val assets = json.optJSONArray("assets") ?: return@Thread
-                var apkUrl: String? = null
-                for (i in 0 until assets.length()) {
-                    val asset = assets.getJSONObject(i)
-                    val name = asset.optString("name")
-                    if (name.endsWith(".apk", ignoreCase = true)) {
-                        apkUrl = asset.optString("browser_download_url")
-                        break
-                    }
-                }
-                if (apkUrl == null) {
-                    Log.i(TAG, "Latest release $tagName has no APK asset")
-                    return@Thread
-                }
-
-                notifyUpdateAvailable(appContext, tagName, apkUrl)
-            } catch (e: Exception) {
-                Log.e(TAG, "Update check failed: ${e.message}")
-            }
+            val info = runCatching { fetchLatestIfNewer(appContext) }.getOrNull()
+            // Only stamp the throttle once we actually know the result, so a
+            // failed/skipped check doesn't block a real check for 12h.
+            prefs.edit().putLong(PREF_LAST_CHECK, System.currentTimeMillis()).apply()
+            if (info != null) notifyUpdateAvailable(appContext, info.version, info.apkUrl)
         }.start()
+    }
+
+    /** On-demand check bypassing the throttle. Must be called off the main thread. */
+    fun checkForUpdateNowBlocking(context: Context): UpdateInfo? {
+        val appContext = context.applicationContext
+        val info = fetchLatestIfNewer(appContext)
+        val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefs.edit().putLong(PREF_LAST_CHECK, System.currentTimeMillis()).apply()
+        if (info != null) notifyUpdateAvailable(appContext, info.version, info.apkUrl)
+        return info
+    }
+
+    private fun fetchLatestIfNewer(context: Context): UpdateInfo? {
+        val conn = URL(API_URL).openConnection() as HttpURLConnection
+        conn.setRequestProperty("Accept", "application/vnd.github+json")
+        conn.connectTimeout = 10000
+        conn.readTimeout = 10000
+
+        if (conn.responseCode != 200) {
+            Log.i(TAG, "Update check returned ${conn.responseCode}")
+            return null
+        }
+
+        val body = conn.inputStream.bufferedReader().use { it.readText() }
+        val json = JSONObject(body)
+        val tagName = json.optString("tag_name", "").removePrefix("v")
+        if (tagName.isEmpty()) return null
+
+        val currentVersion = context.packageManager
+            .getPackageInfo(context.packageName, 0).versionName ?: return null
+
+        if (!isNewer(tagName, currentVersion)) return null
+
+        val assets = json.optJSONArray("assets") ?: return null
+        for (i in 0 until assets.length()) {
+            val asset = assets.getJSONObject(i)
+            val name = asset.optString("name")
+            if (name.endsWith(".apk", ignoreCase = true)) {
+                val apkUrl = asset.optString("browser_download_url")
+                return UpdateInfo(tagName, apkUrl)
+            }
+        }
+        Log.i(TAG, "Latest release $tagName has no APK asset")
+        return null
     }
 
     private fun isNewer(latest: String, current: String): Boolean {

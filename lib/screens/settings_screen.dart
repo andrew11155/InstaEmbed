@@ -1,7 +1,58 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 
-class SettingsScreen extends StatelessWidget {
+class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
+
+  @override
+  State<SettingsScreen> createState() => _SettingsScreenState();
+}
+
+class _SettingsScreenState extends State<SettingsScreen> {
+  static const _updaterChannel = MethodChannel('instaembed/updater');
+
+  String _version = '';
+  bool _checkingForUpdate = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadVersion();
+  }
+
+  Future<void> _loadVersion() async {
+    final info = await PackageInfo.fromPlatform();
+    if (mounted) setState(() => _version = info.version);
+  }
+
+  Future<void> _checkForUpdate() async {
+    setState(() => _checkingForUpdate = true);
+    try {
+      final result = await _updaterChannel.invokeMethod<Map<Object?, Object?>>(
+        'checkForUpdateNow',
+      );
+      final available = result?['available'] == true;
+      final version = result?['version'] as String?;
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            available
+                ? 'Update v$version available — check your notifications'
+                : "You're on the latest version",
+          ),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Update check failed. Try again later.')),
+      );
+    } finally {
+      if (mounted) setState(() => _checkingForUpdate = false);
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -22,7 +73,10 @@ class SettingsScreen extends StatelessWidget {
                   'InstaEmbed',
                   style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
                 ),
-                const Text('v1.0.0', style: TextStyle(color: Colors.grey)),
+                Text(
+                  _version.isEmpty ? '' : 'v$_version',
+                  style: const TextStyle(color: Colors.grey),
+                ),
               ],
             ),
           ),
@@ -55,10 +109,23 @@ class SettingsScreen extends StatelessWidget {
             },
           ),
           const Divider(),
+          ListTile(
+            leading: _checkingForUpdate
+                ? const SizedBox(
+                    width: 24,
+                    height: 24,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.system_update),
+            title: const Text('Check for Updates'),
+            subtitle: const Text('Check GitHub for a newer version'),
+            onTap: _checkingForUpdate ? null : _checkForUpdate,
+          ),
+          const Divider(),
           const ListTile(
-            leading: const Icon(Icons.code),
-            title: const Text('No accounts required'),
-            subtitle: const Text('Works entirely on your device'),
+            leading: Icon(Icons.code),
+            title: Text('No accounts required'),
+            subtitle: Text('Works entirely on your device'),
           ),
         ],
       ),
