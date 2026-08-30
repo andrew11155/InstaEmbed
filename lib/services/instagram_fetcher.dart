@@ -53,7 +53,7 @@ class InstagramFetcher {
       'User-Agent': _userAgent,
       'X-IG-App-ID': _igAppId,
       'Content-Type': 'application/x-www-form-urlencoded',
-      if (csrfToken != null) 'X-CSRFToken': csrfToken,
+      'X-CSRFToken': ?csrfToken,
     };
 
     final response = await http.post(

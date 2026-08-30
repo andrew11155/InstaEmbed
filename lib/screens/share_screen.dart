@@ -15,12 +15,13 @@ class ShareScreen extends StatefulWidget {
   State<ShareScreen> createState() => _ShareScreenState();
 }
 
-enum _ScreenState { loading, preview, error, sharing, done }
+enum _ScreenState { loading, compressing, preview, error, sharing, done }
 
 class _ShareScreenState extends State<ShareScreen> {
   _ScreenState _state = _ScreenState.loading;
   PostData? _postData;
   File? _downloadedFile;
+  File? _compressedFile;
   String? _errorMsg;
 
   @override
@@ -39,11 +40,20 @@ class _ShareScreenState extends State<ShareScreen> {
       final data = await InstagramFetcher.fetchPost(widget.instagramUrl);
       final mediaUrl = data.isVideo ? data.videoUrl : data.imageUrl;
       if (mediaUrl == null) throw Exception('No downloadable media');
-      final file = await VideoDownloader.downloadFile(mediaUrl, data.shortcode);
+
+      final rawFile = await VideoDownloader.downloadFile(mediaUrl, data.shortcode);
+      File? compressed;
+
+      if (data.isVideo && await rawFile.length() > VideoDownloader.compressionThresholdBytes) {
+        if (mounted) setState(() => _state = _ScreenState.compressing);
+        compressed = await VideoDownloader.compressIfNeeded(rawFile, data.shortcode);
+      }
+
       if (!mounted) return;
       setState(() {
         _postData = data;
-        _downloadedFile = file;
+        _downloadedFile = rawFile;
+        _compressedFile = compressed;
         _state = _ScreenState.preview;
       });
     } catch (e) {
@@ -56,16 +66,23 @@ class _ShareScreenState extends State<ShareScreen> {
   }
 
   Future<void> _share() async {
-    if (_downloadedFile == null) return;
+    final fileToShare = _compressedFile ?? _downloadedFile;
+    if (fileToShare == null) return;
     setState(() => _state = _ScreenState.sharing);
 
     try {
       await SharePlus.instance.share(
-        ShareParams(files: [XFile(_downloadedFile!.path)]),
+        ShareParams(files: [XFile(fileToShare.path)]),
       );
     } catch (_) {}
 
-    await TempFileManager.deleteFile(_downloadedFile!);
+    if (_downloadedFile != null) {
+      await TempFileManager.deleteFile(_downloadedFile!);
+    }
+    if (_compressedFile != null && _compressedFile!.path != _downloadedFile?.path) {
+      await TempFileManager.deleteFile(_compressedFile!);
+    }
+
     if (!mounted) return;
     setState(() => _state = _ScreenState.done);
   }
@@ -90,7 +107,21 @@ class _ShareScreenState extends State<ShareScreen> {
             children: [
               CircularProgressIndicator(),
               SizedBox(height: 16),
-              Text('Fetching video...'),
+              Text('Fetching post...'),
+            ],
+          ),
+        );
+      case _ScreenState.compressing:
+        return const Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              CircularProgressIndicator(),
+              SizedBox(height: 16),
+              Text(
+                'Compressing video for Discord (<20MB)...',
+                style: TextStyle(fontWeight: FontWeight.w500),
+              ),
             ],
           ),
         );
@@ -130,7 +161,9 @@ class _ShareScreenState extends State<ShareScreen> {
 
   Widget _buildPreview() {
     final data = _postData!;
-    final fileSize = _downloadedFile != null ? _downloadedFile!.lengthSync() : 0;
+    final file = _compressedFile ?? _downloadedFile;
+    final fileSize = file != null && file.existsSync() ? file.lengthSync() : 0;
+    final wasCompressed = _compressedFile != null && _compressedFile!.path != _downloadedFile?.path;
 
     return SingleChildScrollView(
       padding: const EdgeInsets.all(16),
@@ -144,7 +177,7 @@ class _ShareScreenState extends State<ShareScreen> {
                 data.imageUrl!,
                 height: 300,
                 fit: BoxFit.cover,
-                errorBuilder: (_, __, ___) => Container(
+                errorBuilder: (_, _, _) => Container(
                   height: 300,
                   color: Colors.grey[300],
                   child: const Center(child: Icon(Icons.broken_image, size: 64)),
@@ -191,7 +224,25 @@ class _ShareScreenState extends State<ShareScreen> {
               Icon(Icons.attach_file, color: Colors.grey[500], size: 18),
               const SizedBox(width: 4),
               Text(VideoDownloader.formatFileSize(fileSize)),
-              const SizedBox(height: 8),
+              if (wasCompressed) ...[
+                const SizedBox(width: 4),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: Colors.orange[100],
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Text(
+                    'COMPRESSED',
+                    style: TextStyle(
+                      fontSize: 10,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.orange[900],
+                    ),
+                  ),
+                ),
+              ],
+              const SizedBox(width: 8),
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
                 decoration: BoxDecoration(

@@ -32,7 +32,12 @@ class ShareActivity : Activity() {
     private val IG_APP_ID = "936619743392459"
     private val GRAPHQL_ENDPOINT = "https://www.instagram.com/graphql/query/"
     private val DOC_ID = "27128499623469141"
-    private val DISCORD_FREE_LIMIT = 20L * 1024 * 1024
+
+    companion object {
+        const val DISCORD_MAX_BYTES = 20L * 1024 * 1024 // 20 MB max Discord free limit
+        const val COMPRESSION_THRESHOLD_BYTES = 19L * 1024 * 1024 // Compress if > 19 MB
+        const val TARGET_COMPRESSED_BYTES = 18L * 1024 * 1024 // Aim for ~18 MB
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -95,12 +100,14 @@ class ShareActivity : Activity() {
             Log.i(TAG, "Downloaded ${tempFile.length()} bytes to ${tempFile.path}")
 
             var fileToShare = tempFile
-            if (isVideo && tempFile.length() > DISCORD_FREE_LIMIT) {
-                updateNotification("Compressing video...")
+            if (isVideo && tempFile.length() > COMPRESSION_THRESHOLD_BYTES) {
+                updateNotification("Compressing video for Discord (<20MB)...")
                 val compressed = compressVideo(tempFile, shortcode)
-                if (compressed != null && compressed.length() < tempFile.length()) {
+                if (compressed != null && compressed.exists() && compressed.length() > 0) {
                     fileToShare = compressed
-                    Log.i(TAG, "Compressed to ${compressed.length()} bytes")
+                    Log.i(TAG, "Compressed video to ${compressed.length()} bytes")
+                } else {
+                    Log.w(TAG, "Compression failed or did not reduce size; sharing downloaded file")
                 }
             }
 
@@ -295,14 +302,14 @@ class ShareActivity : Activity() {
     private fun compressVideo(input: File, shortcode: String): File? {
         try {
             val output = File(cacheDir, "instaembed_${shortcode}_compressed.mp4")
-            val success = VideoCompressor.compress(input, output, DISCORD_FREE_LIMIT)
+            val success = VideoCompressor.compress(input, output, TARGET_COMPRESSED_BYTES)
             if (success && output.exists() && output.length() > 0) {
                 return output
             }
             output.delete()
             return null
         } catch (e: Exception) {
-            Log.e(TAG, "compressVideo failed: ${e.message}")
+            Log.e(TAG, "compressVideo failed: ${e.message}", e)
             return null
         }
     }
