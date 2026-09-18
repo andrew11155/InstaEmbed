@@ -338,7 +338,7 @@ object VideoCompressor {
             videoFormat.getInteger(MediaFormat.KEY_FRAME_RATE)
         } else 30
 
-        if (width <= 0 || height <= 0 || durationUs <= 0L) {
+        if (width <= 0 || height <= 0 || durationUs <= 0L || rotation == 0) {
             try {
                 val retriever = MediaMetadataRetriever()
                 retriever.setDataSource(input.path)

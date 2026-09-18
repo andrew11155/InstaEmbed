@@ -9,5 +9,6 @@ void main() {
 
     expect(find.text('InstaEmbed'), findsWidgets);
     expect(find.byType(TextField), findsOneWidget);
+    expect(find.text('Compress & Share a Video File'), findsOneWidget);
   });
 }

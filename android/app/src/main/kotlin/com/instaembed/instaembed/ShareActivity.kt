@@ -3,11 +3,15 @@ package com.instaembed.instaembed
 import android.app.Activity
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.content.ClipData
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.OpenableColumns
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.FileProvider
@@ -41,25 +45,80 @@ class ShareActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        handleIntent(intent)
+    }
 
-        val text = intent?.getStringExtra(Intent.EXTRA_TEXT) ?: run {
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIntent(intent)
+    }
+
+    private fun handleIntent(intent: Intent?) {
+        if (intent == null) {
             finish()
             return
         }
 
-        val shortcode = extractShortcode(text)
-        if (shortcode == null) {
-            finish()
-            return
+        val action = intent.action
+        val type = intent.type
+
+        // 1. Check for multiple video URIs (ACTION_SEND_MULTIPLE)
+        if (action == Intent.ACTION_SEND_MULTIPLE) {
+            val uris: ArrayList<Uri>? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM)
+            }
+            if (!uris.isNullOrEmpty()) {
+                startNotificationAndUpdates()
+                Thread { processMultipleVideos(uris) }.start()
+                return
+            }
         }
 
+        // 2. Check for single video URI (ACTION_SEND with EXTRA_STREAM)
+        val isVideoType = type != null && (type.startsWith("video/") || type == "application/mp4" || type == "application/octet-stream")
+        val streamUri: Uri? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            intent.getParcelableExtra(Intent.EXTRA_STREAM)
+        } ?: if (isVideoType) {
+            intent.clipData?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.uri ?: intent.data
+        } else null
+
+        if (streamUri != null && (isVideoType || action == Intent.ACTION_SEND)) {
+            val mimeType = type ?: contentResolver.getType(streamUri)
+            val isLikelyVideo = mimeType == null || mimeType.startsWith("video/") || mimeType == "application/mp4" || mimeType == "application/octet-stream"
+            if (isLikelyVideo) {
+                startNotificationAndUpdates()
+                Thread { processVideoShare(streamUri) }.start()
+                return
+            }
+        }
+
+        // 3. Check for Instagram text link
+        val text = intent.getStringExtra(Intent.EXTRA_TEXT)
+        if (text != null) {
+            val shortcode = extractShortcode(text)
+            if (shortcode != null) {
+                startNotificationAndUpdates()
+                Thread { processShare(text, shortcode) }.start()
+                return
+            }
+        }
+
+        finish()
+    }
+
+    private fun startNotificationAndUpdates() {
         if (checkSelfPermission("android.permission.POST_NOTIFICATIONS") == PackageManager.PERMISSION_GRANTED) {
             createNotificationChannel()
             showNotification("Preparing video...")
         }
-
         UpdateManager.checkForUpdateAsync(this)
-        Thread { processShare(text, shortcode) }.start()
     }
 
     override fun onResume() {
@@ -122,6 +181,7 @@ class ShareActivity : Activity() {
             val shareIntent = Intent(Intent.ACTION_SEND).apply {
                 type = mimeType
                 putExtra(Intent.EXTRA_STREAM, uri)
+                clipData = ClipData.newRawUri(null, uri)
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
 
@@ -137,6 +197,179 @@ class ShareActivity : Activity() {
             Log.e(TAG, "processShare failed: ${e.message}", e)
             cleanupAndFinish()
         }
+    }
+
+    private fun processVideoShare(uri: Uri) {
+        try {
+            updateNotification("Preparing video...")
+
+            val timestamp = System.currentTimeMillis()
+            val originalName = getFileName(uri) ?: "video.mp4"
+            val extension = originalName.substringAfterLast('.', "mp4")
+            val tempFile = File(cacheDir, "instaembed_shared_${timestamp}.${extension}")
+
+            val copied = try {
+                contentResolver.openInputStream(uri)?.use { input ->
+                    FileOutputStream(tempFile).use { output ->
+                        input.copyTo(output)
+                    }
+                }
+                tempFile.exists() && tempFile.length() > 0
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to copy video stream: ${e.message}", e)
+                false
+            }
+
+            if (!copied || tempFile.length() == 0L) {
+                Log.e(TAG, "Failed to read video stream from $uri")
+                tempFile.delete()
+                cleanupAndFinish()
+                return
+            }
+
+            Log.i(TAG, "Received video: ${tempFile.length()} bytes to ${tempFile.path}")
+
+            var fileToShare = tempFile
+            if (tempFile.length() > COMPRESSION_THRESHOLD_BYTES) {
+                updateNotification("Compressing video for Discord (<20MB)...")
+                val compressed = compressVideo(tempFile, "shared_${timestamp}")
+                if (compressed != null && compressed.exists() && compressed.length() > 0) {
+                    fileToShare = compressed
+                    Log.i(TAG, "Compressed video to ${compressed.length()} bytes")
+                } else {
+                    Log.w(TAG, "Compression failed or did not reduce size; sharing original file")
+                }
+            }
+
+            val shareUri = FileProvider.getUriForFile(
+                this,
+                "${packageName}.fileprovider",
+                fileToShare
+            )
+            Log.i(TAG, "Sharing URI: $shareUri, size: ${fileToShare.length()}")
+
+            val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                type = "video/mp4"
+                putExtra(Intent.EXTRA_STREAM, shareUri)
+                clipData = ClipData.newRawUri(null, shareUri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+
+            dismissNotification()
+
+            pendingCleanupFiles.add(tempFile)
+            if (fileToShare != tempFile) pendingCleanupFiles.add(fileToShare)
+
+            shareLaunched = true
+            startActivity(Intent.createChooser(shareIntent, null))
+
+        } catch (e: Exception) {
+            Log.e(TAG, "processVideoShare failed: ${e.message}", e)
+            cleanupAndFinish()
+        }
+    }
+
+    private fun processMultipleVideos(uris: List<Uri>) {
+        try {
+            val timestamp = System.currentTimeMillis()
+            val filesToShare = mutableListOf<File>()
+            val total = uris.size
+
+            for ((index, uri) in uris.withIndex()) {
+                val fileNum = index + 1
+                updateNotification("Preparing video $fileNum of $total...")
+                val originalName = getFileName(uri) ?: "video_$index.mp4"
+                val extension = originalName.substringAfterLast('.', "mp4")
+                val tempFile = File(cacheDir, "instaembed_shared_${timestamp}_$index.${extension}")
+
+                val copied = try {
+                    contentResolver.openInputStream(uri)?.use { input ->
+                        FileOutputStream(tempFile).use { output ->
+                            input.copyTo(output)
+                        }
+                    }
+                    tempFile.exists() && tempFile.length() > 0
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to copy video stream $index: ${e.message}", e)
+                    false
+                }
+
+                if (!copied || tempFile.length() == 0L) {
+                    tempFile.delete()
+                    continue
+                }
+
+                pendingCleanupFiles.add(tempFile)
+
+                var targetFile = tempFile
+                if (tempFile.length() > COMPRESSION_THRESHOLD_BYTES) {
+                    updateNotification("Compressing video $fileNum of $total (<20MB)...")
+                    val compressed = compressVideo(tempFile, "shared_${timestamp}_$index")
+                    if (compressed != null && compressed.exists() && compressed.length() > 0) {
+                        targetFile = compressed
+                        pendingCleanupFiles.add(compressed)
+                        Log.i(TAG, "Compressed video $fileNum to ${compressed.length()} bytes")
+                    } else {
+                        Log.w(TAG, "Compression failed for video $fileNum; sharing original")
+                    }
+                }
+                filesToShare.add(targetFile)
+            }
+
+            if (filesToShare.isEmpty()) {
+                Log.e(TAG, "No valid videos to share")
+                cleanupAndFinish()
+                return
+            }
+
+            val shareUris = ArrayList(filesToShare.map { file ->
+                FileProvider.getUriForFile(this, "${packageName}.fileprovider", file)
+            })
+
+            val shareIntent = if (shareUris.size == 1) {
+                Intent(Intent.ACTION_SEND).apply {
+                    type = "video/mp4"
+                    putExtra(Intent.EXTRA_STREAM, shareUris[0])
+                    clipData = ClipData.newRawUri(null, shareUris[0])
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+            } else {
+                Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+                    type = "video/mp4"
+                    putParcelableArrayListExtra(Intent.EXTRA_STREAM, shareUris)
+                    clipData = ClipData.newRawUri(null, shareUris[0]).apply {
+                        for (i in 1 until shareUris.size) {
+                            addItem(ClipData.Item(shareUris[i]))
+                        }
+                    }
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+            }
+
+            dismissNotification()
+            shareLaunched = true
+            startActivity(Intent.createChooser(shareIntent, null))
+
+        } catch (e: Exception) {
+            Log.e(TAG, "processMultipleVideos failed: ${e.message}", e)
+            cleanupAndFinish()
+        }
+    }
+
+    private fun getFileName(uri: Uri): String? {
+        if (uri.scheme == "content") {
+            try {
+                contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                        if (idx >= 0) return cursor.getString(idx)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to query filename: ${e.message}")
+            }
+        }
+        return uri.lastPathSegment
     }
 
     private fun cleanupAndFinish() {

@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'screens/share_screen.dart';
 import 'screens/settings_screen.dart';
+import 'screens/video_share_screen.dart';
 import 'services/instagram_fetcher.dart';
 
 void main() {
@@ -31,6 +33,7 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
+  static const _compressorChannel = MethodChannel('instaembed/compressor');
   final TextEditingController _urlController = TextEditingController();
 
   void _openShareScreen() {
@@ -42,6 +45,34 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
       );
       _urlController.clear();
+    }
+  }
+
+  Future<void> _pickVideo() async {
+    try {
+      final result = await _compressorChannel.invokeMethod<Map<Object?, Object?>>('pickVideo');
+      if (result != null && mounted) {
+        final path = result['path'] as String?;
+        final name = result['name'] as String? ?? 'video.mp4';
+        final size = (result['size'] as num?)?.toInt() ?? 0;
+        if (path != null) {
+          Navigator.of(context).push(
+            MaterialPageRoute(
+              builder: (_) => VideoShareScreen(
+                filePath: path,
+                fileName: name,
+                fileSize: size,
+              ),
+            ),
+          );
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to select video: $e')),
+        );
+      }
     }
   }
 
@@ -83,13 +114,13 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
             const SizedBox(height: 8),
             Text(
-              'Share Instagram videos to Discord\nwithout proxy services',
+              'Share Instagram & local videos to Discord\ncompressed under 20MB',
               textAlign: TextAlign.center,
               style: TextStyle(fontSize: 16, color: Colors.grey[600]),
             ),
             const SizedBox(height: 32),
             const Text(
-              'Or paste a URL manually:',
+              'Paste an Instagram URL:',
               textAlign: TextAlign.center,
             ),
             const SizedBox(height: 8),
@@ -109,8 +140,31 @@ class _HomeScreenState extends State<HomeScreen> {
               onSubmitted: (_) => _openShareScreen(),
             ),
             const SizedBox(height: 16),
+            Row(
+              children: [
+                Expanded(child: Divider(color: Colors.grey[300])),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  child: Text('OR', style: TextStyle(color: Colors.grey[500], fontSize: 12)),
+                ),
+                Expanded(child: Divider(color: Colors.grey[300])),
+              ],
+            ),
+            const SizedBox(height: 16),
+            OutlinedButton.icon(
+              onPressed: _pickVideo,
+              icon: const Icon(Icons.video_library_rounded),
+              label: const Text('Compress & Share a Video File'),
+              style: OutlinedButton.styleFrom(
+                padding: const EdgeInsets.symmetric(vertical: 14),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+              ),
+            ),
+            const SizedBox(height: 20),
             Text(
-              'Tip: Share an Instagram link from the Instagram app\nand select InstaEmbed from the share menu',
+              'Tip: Share a video or Instagram link from any app\nand select InstaEmbed from the share menu',
               textAlign: TextAlign.center,
               style: TextStyle(fontSize: 12, color: Colors.grey[500]),
             ),

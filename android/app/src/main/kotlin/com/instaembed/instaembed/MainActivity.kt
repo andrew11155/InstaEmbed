@@ -1,17 +1,91 @@
 package com.instaembed.instaembed
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
+import android.provider.OpenableColumns
+import android.util.Log
 import androidx.core.app.ActivityCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
+import java.io.FileOutputStream
 
 class MainActivity : FlutterActivity() {
     private val UPDATER_CHANNEL = "instaembed/updater"
     private val COMPRESSOR_CHANNEL = "instaembed/compressor"
+
+    companion object {
+        private const val REQUEST_PICK_VIDEO = 2002
+    }
+
+    private var pickVideoResult: MethodChannel.Result? = null
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQUEST_PICK_VIDEO) {
+            val result = pickVideoResult
+            pickVideoResult = null
+            if (result == null) return
+
+            if (resultCode != RESULT_OK || data == null) {
+                result.success(null)
+                return
+            }
+
+            val uri: Uri? = data.data ?: data.clipData?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.uri
+            if (uri == null) {
+                result.success(null)
+                return
+            }
+
+            Thread {
+                try {
+                    val fileName = getFileName(uri) ?: "video.mp4"
+                    val extension = fileName.substringAfterLast('.', "mp4")
+                    val tempFile = File(cacheDir, "instaembed_picked_${System.currentTimeMillis()}.${extension}")
+                    contentResolver.openInputStream(uri)?.use { input ->
+                        FileOutputStream(tempFile).use { output ->
+                            input.copyTo(output)
+                        }
+                    }
+                    val size = tempFile.length()
+                    val path = tempFile.absolutePath
+                    runOnUiThread {
+                        result.success(mapOf(
+                            "path" to path,
+                            "size" to size,
+                            "name" to fileName
+                        ))
+                    }
+                } catch (e: Exception) {
+                    Log.e("MainActivity", "Failed to process picked video: ${e.message}", e)
+                    runOnUiThread {
+                        result.error("PICK_FAILED", e.message, null)
+                    }
+                }
+            }.start()
+        }
+    }
+
+    private fun getFileName(uri: Uri): String? {
+        if (uri.scheme == "content") {
+            try {
+                contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                        if (idx >= 0) return cursor.getString(idx)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w("MainActivity", "Failed to query filename: ${e.message}")
+            }
+        }
+        return uri.lastPathSegment
+    }
 
     override fun onResume() {
         super.onResume()
@@ -86,6 +160,24 @@ class MainActivity : FlutterActivity() {
                             }
                         }
                     }.start()
+                }
+                "pickVideo" -> {
+                    if (pickVideoResult != null) {
+                        result.error("ALREADY_ACTIVE", "Video picker is already running", null)
+                        return@setMethodCallHandler
+                    }
+                    pickVideoResult = result
+                    try {
+                        val pickIntent = Intent(Intent.ACTION_GET_CONTENT).apply {
+                            type = "video/*"
+                            addCategory(Intent.CATEGORY_OPENABLE)
+                            putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("video/*"))
+                        }
+                        startActivityForResult(Intent.createChooser(pickIntent, "Select Video"), REQUEST_PICK_VIDEO)
+                    } catch (e: Exception) {
+                        pickVideoResult = null
+                        result.error("LAUNCH_FAILED", e.message, null)
+                    }
                 }
                 else -> result.notImplemented()
             }

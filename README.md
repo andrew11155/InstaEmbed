@@ -1,16 +1,23 @@
 # InstaEmbed
 
-A simple Android app that downloads Instagram videos and shares them directly to Discord (or any other app) via the system share sheet. No accounts, no proxy services, no servers — everything runs on your device.
+A simple Android app that downloads Instagram videos or compresses any video file and shares them directly to Discord (or any other app) via the system share sheet. No accounts, no proxy services, no servers — everything runs on your device.
 
 ## How It Works
 
+### Instagram Videos
 1. Find a reel or video on Instagram
 2. Tap **Share** → select **InstaEmbed**
 3. The app fetches the video using Instagram's GraphQL API
 4. The system share sheet opens — pick Discord and your channel
 5. Done. The video uploads from your account and temp files are auto-deleted.
 
-You can also open the app directly and paste an Instagram URL manually.
+### Any Video Files
+1. In your Gallery, Photos, Files, or camera, tap **Share** on any video
+2. Select **InstaEmbed** from the share sheet
+3. If the video is larger than Discord's limit (20MB), InstaEmbed automatically compresses it on-device
+4. The share sheet opens — pick Discord and your channel!
+
+You can also open the app directly to paste an Instagram URL or pick a video file manually.
 
 ## Why?
 
@@ -20,19 +27,22 @@ Services like kkinstagram, ddinstagram, vxinstagram, and InstaFix that proxy Ins
 - No accounts or API keys required
 - Works entirely on-device
 - Videos show up as actual file uploads in Discord, not broken embed links
+- Compress any oversized video file on-device to fit Discord's 20MB free upload limit
 
 ## Tech Stack
 
 - **Flutter** — cross-platform UI (Android only for now)
-- **Native Kotlin** — Instagram API calls, video downloading, and sharing are handled entirely in native Android code for speed. The Flutter engine is only used for the manual URL input screen.
+- **Native Kotlin** — Instagram API calls, video downloading, and sharing are handled entirely in native Android code for speed. The Flutter engine is only used for the manual URL input / video picker screen.
 - **Instagram GraphQL API** — fetches video URLs from public posts without authentication
+- **Android MediaCodec** — fast, hardware-accelerated video compression targeting <= 20MB
 
 ## Current Status
 
 This was a fun project built in a day to scratch a personal itch. Most of the core functionality works well:
 
 - Sharing Instagram reels/videos to Discord via the system share sheet
-- Headless mode — share from Instagram and never see the app UI
+- Sharing local video files from Gallery / Files to Discord with automatic 20MB compression
+- Headless mode — share from Instagram or Gallery and never see the app UI
 - Temp file auto-cleanup after sharing
 - On-device video compression (MediaCodec) for files over Discord's free upload limit (20MB)
 - Self-updating — checks GitHub Releases in the background and prompts to install new versions

@@ -85,18 +85,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ListTile(
             leading: const Icon(Icons.info_outline),
             title: const Text('How to use'),
-            subtitle: const Text('Share Instagram links to this app'),
+            subtitle: const Text('Share Instagram links or video files to this app'),
             onTap: () {
               showDialog(
                 context: context,
                 builder: (_) => AlertDialog(
                   title: const Text('How to use'),
                   content: const Text(
-                    '1. Open Instagram and find a video or reel\n'
-                    '2. Tap the Share button\n'
-                    '3. Select InstaEmbed from the share sheet\n'
-                    '4. Tap "Share to Discord" and pick your channel\n'
-                    '5. The video is sent from your account!',
+                    'Sharing Videos & Instagram Links:\n\n'
+                    '1. From Instagram, Gallery, or any app, tap Share\n'
+                    '2. Select InstaEmbed from the share menu\n'
+                    '3. InstaEmbed downloads (if Instagram) and compresses the video under 20MB\n'
+                    '4. Pick Discord and your channel to send it!\n\n'
+                    'You can also open InstaEmbed to paste a link or pick a video file from your device.',
                   ),
                   actions: [
                     TextButton(
