@@ -7,6 +7,7 @@ import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.media.MediaMuxer
 import android.util.Log
+import android.view.Surface
 import java.io.File
 import java.nio.ByteBuffer
 
@@ -54,13 +55,10 @@ object VideoCompressor {
             return true
         }
 
-        if (output.exists() && output.length() > targetSizeBytes) {
-            Log.e(TAG, "All compression passes produced file larger than target size. Deleting output.")
+        if (output.exists()) {
             output.delete()
-            return false
         }
-
-        return output.exists() && output.length() > 0 && output.length() < input.length()
+        return false
     }
 
     private fun doCompress(
@@ -73,6 +71,8 @@ object VideoCompressor {
         var audioExtractor: MediaExtractor? = null
         var encoder: MediaCodec? = null
         var decoder: MediaCodec? = null
+        var encoderSurface: Surface? = null
+        var glPipeline: GLVideoPipeline? = null
         var muxer: MediaMuxer? = null
 
         try {
@@ -114,15 +114,15 @@ object VideoCompressor {
             val rawVideoBitRate = ((budgetBits / durationSec) - audioBitRate).toInt()
             val videoBitRate = rawVideoBitRate.coerceIn(MIN_VIDEO_BIT_RATE, MAX_VIDEO_BIT_RATE)
 
-            // Resolution calculation based on bitrate and orientation
-            val isPortrait = inputH > inputW
+            // Resolution calculation based on bitrate and raw stream orientation
+            val isRawPortrait = inputH > inputW
             val maxDimensions = when {
                 videoBitRate < 600_000 || qualityMultiplier <= 0.5f ->
-                    if (isPortrait) Pair(480, 854) else Pair(854, 480)
+                    if (isRawPortrait) Pair(480, 854) else Pair(854, 480)
                 videoBitRate < 1_200_000 || qualityMultiplier <= 0.7f ->
-                    if (isPortrait) Pair(720, 1280) else Pair(1280, 720)
+                    if (isRawPortrait) Pair(720, 1280) else Pair(1280, 720)
                 else ->
-                    if (isPortrait) Pair(1080, 1920) else Pair(1920, 1080)
+                    if (isRawPortrait) Pair(1080, 1920) else Pair(1920, 1080)
             }
             val (outW, outH) = calcSize(inputW, inputH, maxDimensions.first, maxDimensions.second)
 
@@ -149,6 +149,7 @@ object VideoCompressor {
             var muxerVideoTrack = -1
             var muxerAudioTrack = -1
             var muxerStarted = false
+            var videoFramesWritten = 0
 
             val encFormat = MediaFormat.createVideoFormat("video/avc", outW, outH).apply {
                 setInteger(MediaFormat.KEY_BIT_RATE, videoBitRate)
@@ -163,18 +164,26 @@ object VideoCompressor {
 
             encoder = MediaCodec.createEncoderByType("video/avc")
             encoder.configure(encFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-            val inputSurface = encoder.createInputSurface()
+            encoderSurface = encoder.createInputSurface()
             encoder.start()
 
+            glPipeline = GLVideoPipeline(encoderSurface, outW, outH)
+
             decoder = MediaCodec.createDecoderByType(videoFormat.getString(MediaFormat.KEY_MIME)!!)
-            decoder.configure(videoFormat, inputSurface, null, 0)
+            decoder.configure(videoFormat, glPipeline.decoderSurface, null, 0)
             decoder.start()
 
             videoExtractor.selectTrack(videoTrackIdx)
-            val bufferInfo = MediaCodec.BufferInfo()
+
+            val decBufferInfo = MediaCodec.BufferInfo()
+            val encBufferInfo = MediaCodec.BufferInfo()
+            val audioBuffer = if (hasAudio) ByteBuffer.allocateDirect(1024 * 512) else null
+            val audioBufferInfo = if (hasAudio) MediaCodec.BufferInfo() else null
+
             var decoderInputDone = false
             var decoderOutputDone = false
             var encoderDone = false
+            var eosTryAgainCount = 0
 
             while (!encoderDone) {
                 // Feed decoder input
@@ -191,7 +200,7 @@ object VideoCompressor {
                             decoderInputDone = true
                         } else {
                             decoder.queueInputBuffer(
-                                inIdx, 0, sampleSize.toInt(),
+                                inIdx, 0, sampleSize,
                                 videoExtractor.sampleTime, 0
                             )
                             videoExtractor.advance()
@@ -201,10 +210,14 @@ object VideoCompressor {
 
                 // Process decoder output
                 if (!decoderOutputDone) {
-                    val decOutIdx = decoder.dequeueOutputBuffer(bufferInfo, TIMEOUT_US)
+                    val decOutIdx = decoder.dequeueOutputBuffer(decBufferInfo, TIMEOUT_US)
                     if (decOutIdx >= 0) {
-                        val isEos = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
-                        decoder.releaseOutputBuffer(decOutIdx, !isEos)
+                        val isEos = (decBufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
+                        val doRender = !isEos || decBufferInfo.size != 0
+                        decoder.releaseOutputBuffer(decOutIdx, doRender)
+                        if (doRender) {
+                            glPipeline.awaitAndRender(decBufferInfo.presentationTimeUs)
+                        }
                         if (isEos) {
                             decoderOutputDone = true
                             encoder.signalEndOfInputStream()
@@ -213,12 +226,12 @@ object VideoCompressor {
                 }
 
                 // Process encoder output
-                val encOutIdx = encoder.dequeueOutputBuffer(bufferInfo, TIMEOUT_US)
+                val encOutIdx = encoder.dequeueOutputBuffer(encBufferInfo, TIMEOUT_US)
                 when {
                     encOutIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                         if (!muxerStarted) {
                             muxerVideoTrack = muxer.addTrack(encoder.outputFormat)
-                            if (hasAudio && audioFormat != null) {
+                            if (hasAudio) {
                                 try {
                                     muxerAudioTrack = muxer.addTrack(audioFormat)
                                 } catch (e: Exception) {
@@ -231,26 +244,54 @@ object VideoCompressor {
                         }
                     }
                     encOutIdx >= 0 -> {
+                        eosTryAgainCount = 0
                         val data = encoder.getOutputBuffer(encOutIdx)!!
-                        if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
-                            bufferInfo.size = 0
+                        if (encBufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
+                            encBufferInfo.size = 0
                         }
-                        if (bufferInfo.size > 0 && muxerStarted) {
-                            data.position(bufferInfo.offset)
-                            data.limit(bufferInfo.offset + bufferInfo.size)
-                            muxer.writeSampleData(muxerVideoTrack, data, bufferInfo)
+                        if (encBufferInfo.size > 0 && muxerStarted) {
+                            if (hasAudio && audioExtractor != null && muxerAudioTrack >= 0) {
+                                writeAudioUpTo(
+                                    audioExtractor,
+                                    muxer,
+                                    muxerAudioTrack,
+                                    audioBuffer!!,
+                                    audioBufferInfo!!,
+                                    encBufferInfo.presentationTimeUs
+                                )
+                            }
+                            data.position(encBufferInfo.offset)
+                            data.limit(encBufferInfo.offset + encBufferInfo.size)
+                            muxer.writeSampleData(muxerVideoTrack, data, encBufferInfo)
+                            videoFramesWritten++
                         }
                         encoder.releaseOutputBuffer(encOutIdx, false)
-                        if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
+                        if (encBufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
                             encoderDone = true
+                        }
+                    }
+                    encOutIdx == MediaCodec.INFO_TRY_AGAIN_LATER -> {
+                        if (decoderOutputDone) {
+                            eosTryAgainCount++
+                            if (eosTryAgainCount > 100) {
+                                Log.w(TAG, "Encoder timed out waiting for EOS, exiting loop")
+                                encoderDone = true
+                            }
                         }
                     }
                 }
             }
 
-            // Copy audio samples cleanly using the dedicated audio extractor
+            // Drain any remaining audio samples up to EOS
             if (hasAudio && audioExtractor != null && muxerAudioTrack >= 0 && muxerStarted) {
-                copyAudioSamples(audioExtractor, muxer, muxerAudioTrack)
+                writeAudioUpTo(
+                    audioExtractor,
+                    muxer,
+                    muxerAudioTrack,
+                    audioBuffer!!,
+                    audioBufferInfo!!,
+                    -1L
+                )
             }
 
             if (muxerStarted) {
@@ -262,12 +303,14 @@ object VideoCompressor {
                 }
             }
 
-            return output.exists() && output.length() > 0
+            return output.exists() && output.length() > 0 && videoFramesWritten > 0
         } catch (e: Exception) {
             Log.e(TAG, "Compression error: ${e.message}", e)
             if (output.exists()) output.delete()
             return false
         } finally {
+            try { glPipeline?.release() } catch (_: Exception) {}
+            try { encoderSurface?.release() } catch (_: Exception) {}
             try { encoder?.stop() } catch (_: Exception) {}
             try { encoder?.release() } catch (_: Exception) {}
             try { decoder?.stop() } catch (_: Exception) {}
@@ -278,25 +321,39 @@ object VideoCompressor {
         }
     }
 
-    private fun copyAudioSamples(
+    private fun writeAudioUpTo(
         audioExtractor: MediaExtractor,
         muxer: MediaMuxer,
-        muxerAudioTrack: Int
+        muxerAudioTrack: Int,
+        audioBuffer: ByteBuffer,
+        audioBufferInfo: MediaCodec.BufferInfo,
+        targetPtsUs: Long
     ) {
-        val audioBuffer = ByteBuffer.allocateDirect(1024 * 512)
-        val audioBufferInfo = MediaCodec.BufferInfo()
-
         while (true) {
+            val sampleTime = audioExtractor.sampleTime
+            if (sampleTime < 0) {
+                // End of audio stream
+                break
+            }
+            if (targetPtsUs >= 0 && sampleTime > targetPtsUs) {
+                // Audio caught up to current video PTS
+                break
+            }
             audioBuffer.clear()
             val sampleSize = audioExtractor.readSampleData(audioBuffer, 0)
-            if (sampleSize < 0) break
-
+            if (sampleSize < 0) {
+                break
+            }
             audioBufferInfo.offset = 0
             audioBufferInfo.size = sampleSize
-            audioBufferInfo.presentationTimeUs = audioExtractor.sampleTime
+            audioBufferInfo.presentationTimeUs = sampleTime
             audioBufferInfo.flags = audioExtractor.sampleFlags
-
-            muxer.writeSampleData(muxerAudioTrack, audioBuffer, audioBufferInfo)
+            try {
+                muxer.writeSampleData(muxerAudioTrack, audioBuffer, audioBufferInfo)
+            } catch (e: Exception) {
+                Log.w(TAG, "Error writing audio sample: ${e.message}")
+                break
+            }
             audioExtractor.advance()
         }
     }

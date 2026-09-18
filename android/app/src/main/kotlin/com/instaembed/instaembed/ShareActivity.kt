@@ -13,6 +13,7 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.OpenableColumns
 import android.util.Log
+import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.content.FileProvider
 import org.json.JSONObject
@@ -166,7 +167,14 @@ class ShareActivity : Activity() {
                     fileToShare = compressed
                     Log.i(TAG, "Compressed video to ${compressed.length()} bytes")
                 } else {
-                    Log.w(TAG, "Compression failed or did not reduce size; sharing downloaded file")
+                    Log.w(TAG, "Compression failed or did not reduce size")
+                    if (tempFile.length() > DISCORD_MAX_BYTES) {
+                        Log.e(TAG, "Video is ${tempFile.length()} bytes (> 20MB) and compression failed; aborting share")
+                        showToast("Failed to compress video to under Discord's 20MB limit.")
+                        tempFile.delete()
+                        cleanupAndFinish()
+                        return
+                    }
                 }
             }
 
@@ -237,7 +245,14 @@ class ShareActivity : Activity() {
                     fileToShare = compressed
                     Log.i(TAG, "Compressed video to ${compressed.length()} bytes")
                 } else {
-                    Log.w(TAG, "Compression failed or did not reduce size; sharing original file")
+                    Log.w(TAG, "Compression failed or did not reduce size")
+                    if (tempFile.length() > DISCORD_MAX_BYTES) {
+                        Log.e(TAG, "Video is ${tempFile.length()} bytes (> 20MB) and compression failed; aborting share")
+                        showToast("Failed to compress video to under Discord's 20MB limit.")
+                        tempFile.delete()
+                        cleanupAndFinish()
+                        return
+                    }
                 }
             }
 
@@ -310,7 +325,11 @@ class ShareActivity : Activity() {
                         pendingCleanupFiles.add(compressed)
                         Log.i(TAG, "Compressed video $fileNum to ${compressed.length()} bytes")
                     } else {
-                        Log.w(TAG, "Compression failed for video $fileNum; sharing original")
+                        Log.w(TAG, "Compression failed for video $fileNum")
+                        if (tempFile.length() > DISCORD_MAX_BYTES) {
+                            Log.e(TAG, "Video $fileNum is ${tempFile.length()} bytes (> 20MB) and compression failed; skipping")
+                            continue
+                        }
                     }
                 }
                 filesToShare.add(targetFile)
@@ -318,6 +337,7 @@ class ShareActivity : Activity() {
 
             if (filesToShare.isEmpty()) {
                 Log.e(TAG, "No valid videos to share")
+                showToast("Failed to compress video(s) to under Discord's 20MB limit.")
                 cleanupAndFinish()
                 return
             }
@@ -353,6 +373,12 @@ class ShareActivity : Activity() {
         } catch (e: Exception) {
             Log.e(TAG, "processMultipleVideos failed: ${e.message}", e)
             cleanupAndFinish()
+        }
+    }
+
+    private fun showToast(message: String) {
+        handler.post {
+            Toast.makeText(applicationContext, message, Toast.LENGTH_LONG).show()
         }
     }
 
