@@ -17,6 +17,7 @@ import java.io.FileOutputStream
 class MainActivity : FlutterActivity() {
     private val UPDATER_CHANNEL = "instaembed/updater"
     private val COMPRESSOR_CHANNEL = "instaembed/compressor"
+    private val SHARE_CHANNEL = "instaembed/share"
     private val SETTINGS_CHANNEL = "instaembed/settings"
 
     companion object {
@@ -140,6 +141,31 @@ class MainActivity : FlutterActivity() {
             }
         }
 
+        // Shares through MediaStore so Discord can keep reading the file after we're backgrounded
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, SHARE_CHANNEL).setMethodCallHandler { call, result ->
+            if (call.method != "shareFile") {
+                result.notImplemented()
+                return@setMethodCallHandler
+            }
+            val path = call.argument<String>("path")
+            val mimeType = call.argument<String>("mimeType") ?: "video/mp4"
+            if (path == null) {
+                result.error("INVALID_ARGS", "path is required", null)
+                return@setMethodCallHandler
+            }
+            Thread {
+                try {
+                    val chooser = SharedMedia.shareFileIntent(this, File(path), mimeType)
+                    runOnUiThread {
+                        startActivity(chooser)
+                        result.success(true)
+                    }
+                } catch (e: Exception) {
+                    runOnUiThread { result.error("SHARE_FAILED", e.message, null) }
+                }
+            }.start()
+        }
+
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, COMPRESSOR_CHANNEL).setMethodCallHandler { call, result ->
             when (call.method) {
                 "compressVideo" -> {
@@ -152,6 +178,8 @@ class MainActivity : FlutterActivity() {
                         return@setMethodCallHandler
                     }
 
+                    // Foreground service keeps Samsung from freezing the encode if the user leaves
+                    WorkService.begin(this, "Compressing video for Discord (<20MB)...")
                     Thread {
                         try {
                             val inputFile = File(inputPath)
@@ -179,6 +207,8 @@ class MainActivity : FlutterActivity() {
                             runOnUiThread {
                                 result.error("COMPRESS_FAILED", e.message, null)
                             }
+                        } finally {
+                            WorkService.end(this)
                         }
                     }.start()
                 }

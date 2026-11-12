@@ -1,6 +1,6 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
-import 'package:share_plus/share_plus.dart';
+import '../services/media_share.dart';
 import '../models/post_data.dart';
 import '../services/instagram_fetcher.dart';
 import '../services/video_downloader.dart';
@@ -71,9 +71,7 @@ class _ShareScreenState extends State<ShareScreen> {
     setState(() => _state = _ScreenState.sharing);
 
     try {
-      await SharePlus.instance.share(
-        ShareParams(files: [XFile(fileToShare.path)]),
-      );
+      await MediaShare.shareFile(fileToShare);
     } catch (_) {}
 
     if (_downloadedFile != null) {

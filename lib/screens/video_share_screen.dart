@@ -1,6 +1,6 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
-import 'package:share_plus/share_plus.dart';
+import '../services/media_share.dart';
 import '../services/video_downloader.dart';
 import '../services/temp_file_manager.dart';
 
@@ -67,9 +67,7 @@ class _VideoShareScreenState extends State<VideoShareScreen> {
     setState(() => _state = _ScreenState.sharing);
 
     try {
-      await SharePlus.instance.share(
-        ShareParams(files: [XFile(fileToShare.path)]),
-      );
+      await MediaShare.shareFile(fileToShare);
     } catch (_) {}
 
     await TempFileManager.deleteFile(_inputFile);

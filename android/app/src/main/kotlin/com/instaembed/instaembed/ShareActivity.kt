@@ -6,7 +6,6 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.ClipData
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -16,7 +15,6 @@ import android.provider.OpenableColumns
 import android.util.Log
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
-import androidx.core.content.FileProvider
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
@@ -27,8 +25,9 @@ import java.net.URLEncoder
 class ShareActivity : Activity() {
 
     private val TAG = "InstaEmbed"
-    private val CHANNEL_ID = "instaembed_progress"
-    private val NOTIFICATION_ID = 1001
+    private val CHANNEL_ID = WorkService.CHANNEL_ID
+    // Whether this activity holds a WorkService reference (keeps compression from being frozen)
+    private var workActive = false
     private val handler = Handler(Looper.getMainLooper())
     private var shareLaunched = false
     // Remaining parts of a split video, shared one at a time
@@ -144,11 +143,13 @@ class ShareActivity : Activity() {
     }
 
     private fun startNotificationAndUpdates() {
-        Thread { deleteStaleTempFiles() }.start()
-        if (checkSelfPermission("android.permission.POST_NOTIFICATIONS") == PackageManager.PERMISSION_GRANTED) {
-            createNotificationChannel()
-            showNotification("Preparing video...")
-        }
+        Thread {
+            deleteStaleTempFiles()
+            SharedMedia.deleteStale(this)
+        }.start()
+        // Runs even without notification permission: the foreground service is what keeps
+        // Samsung from freezing us mid-compression; the notification is just its visible side
+        showNotification("Preparing video...")
         UpdateManager.checkForUpdateAsync(this)
     }
 
@@ -210,12 +211,9 @@ class ShareActivity : Activity() {
             }
 
             val mimeType = if (isVideo) "video/mp4" else "image/jpeg"
-            val uri = FileProvider.getUriForFile(
-                this,
-                "${packageName}.fileprovider",
-                fileToShare
-            )
-            Log.i(TAG, "Sharing URI: $uri, mimeType: $mimeType, size: ${fileToShare.length()}")
+            val size = fileToShare.length()
+            val uri = SharedMedia.publish(this, fileToShare, mimeType)
+            Log.i(TAG, "Sharing URI: $uri, mimeType: $mimeType, size: $size")
 
             val shareIntent = Intent(Intent.ACTION_SEND).apply {
                 type = mimeType
@@ -278,12 +276,9 @@ class ShareActivity : Activity() {
             }
             val fileToShare = prepared[0]
 
-            val shareUri = FileProvider.getUriForFile(
-                this,
-                "${packageName}.fileprovider",
-                fileToShare
-            )
-            Log.i(TAG, "Sharing URI: $shareUri, size: ${fileToShare.length()}")
+            val size = fileToShare.length()
+            val shareUri = SharedMedia.publish(this, fileToShare, "video/mp4")
+            Log.i(TAG, "Sharing URI: $shareUri, size: $size")
 
             val shareIntent = Intent(Intent.ACTION_SEND).apply {
                 type = "video/mp4"
@@ -350,7 +345,7 @@ class ShareActivity : Activity() {
             }
 
             val shareUris = ArrayList(filesToShare.map { file ->
-                FileProvider.getUriForFile(this, "${packageName}.fileprovider", file)
+                SharedMedia.publish(this, file, "video/mp4")
             })
 
             val shareIntent = if (shareUris.size == 1) {
@@ -405,19 +400,8 @@ class ShareActivity : Activity() {
         return uri.lastPathSegment
     }
 
-    /**
-     * Opens the share sheet for [uris]. Once the user picks an app, [ShareTargetReceiver] grants
-     * that app lasting read access so a background upload survives this activity finishing.
-     */
     private fun launchChooser(shareIntent: Intent, uris: List<Uri>, title: String? = null) {
-        val callback = Intent(this, ShareTargetReceiver::class.java)
-            .putParcelableArrayListExtra(ShareTargetReceiver.EXTRA_URIS, ArrayList(uris))
-        // Mutable so the system can add EXTRA_CHOSEN_COMPONENT; unique request code per share
-        val pending = PendingIntent.getBroadcast(
-            this, (System.currentTimeMillis() and 0x7fffffff).toInt(), callback,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
-        )
-        startActivity(Intent.createChooser(shareIntent, title, pending.intentSender))
+        startActivity(SharedMedia.chooser(this, shareIntent, uris, title))
     }
 
     private fun cleanupAndFinish() {
@@ -425,52 +409,25 @@ class ShareActivity : Activity() {
         handler.post { finish() }
     }
 
-    private fun createNotificationChannel() {
-        val channel = NotificationChannel(
-            CHANNEL_ID,
-            "InstaEmbed",
-            NotificationManager.IMPORTANCE_LOW
-        ).apply {
-            description = "Video processing progress"
-            setShowBadge(false)
-        }
-        val nm = getSystemService(NotificationManager::class.java)
-        nm.createNotificationChannel(channel)
-    }
+    private fun createNotificationChannel() = WorkService.createChannel(this)
 
+    /** Starts the foreground work service, which owns the progress notification. */
     private fun showNotification(text: String) {
-        try {
-            val notification = NotificationCompat.Builder(this, CHANNEL_ID)
-                .setSmallIcon(android.R.drawable.stat_sys_download)
-                .setContentTitle("InstaEmbed")
-                .setContentText(text)
-                .setOngoing(true)
-                .setPriority(NotificationCompat.PRIORITY_LOW)
-                .build()
-            val nm = getSystemService(NotificationManager::class.java)
-            nm.notify(NOTIFICATION_ID, notification)
-        } catch (_: Exception) {}
+        if (workActive) {
+            WorkService.update(this, text)
+            return
+        }
+        workActive = true
+        WorkService.begin(this, text)
     }
 
-    private fun updateNotification(text: String) {
-        try {
-            val notification = NotificationCompat.Builder(this, CHANNEL_ID)
-                .setSmallIcon(android.R.drawable.stat_sys_download)
-                .setContentTitle("InstaEmbed")
-                .setContentText(text)
-                .setOngoing(true)
-                .setPriority(NotificationCompat.PRIORITY_LOW)
-                .build()
-            val nm = getSystemService(NotificationManager::class.java)
-            nm.notify(NOTIFICATION_ID, notification)
-        } catch (_: Exception) {}
-    }
+    private fun updateNotification(text: String) = WorkService.update(this, text)
 
+    /** Ends this activity's foreground work; safe to call more than once. */
     private fun dismissNotification() {
-        try {
-            val nm = getSystemService(NotificationManager::class.java)
-            nm.cancel(NOTIFICATION_ID)
-        } catch (_: Exception) {}
+        if (!workActive) return
+        workActive = false
+        WorkService.end(this)
     }
 
     /** Tokens scraped from the Instagram homepage that logged-out GraphQL requests need. */
@@ -668,7 +625,7 @@ class ShareActivity : Activity() {
     private fun shareNextPart() {
         val part = partQueue.removeFirstOrNull() ?: return
         val partNum = partTotal - partQueue.size
-        val uri = FileProvider.getUriForFile(this, "${packageName}.fileprovider", part)
+        val uri = SharedMedia.publish(this, part, "video/mp4")
         val shareIntent = Intent(Intent.ACTION_SEND).apply {
             type = "video/mp4"
             putExtra(Intent.EXTRA_STREAM, uri)

@@ -9,7 +9,7 @@ A simple Android app that downloads Instagram videos or compresses any video fil
 2. Tap **Share** → select **InstaEmbed**
 3. The app fetches the video using Instagram's GraphQL API
 4. The system share sheet opens — pick Discord and your channel
-5. Done. The video uploads from your account and temp files are auto-deleted a couple of hours later.
+5. Done. The video uploads from your account. Shared files briefly appear in your gallery under `Movies/InstaEmbed` and are auto-deleted a couple of hours later.
 
 ### Any Video Files
 1. In your Gallery, Photos, Files, or camera, tap **Share** on any video
@@ -46,7 +46,8 @@ This was a fun project built in a day to scratch a personal itch. Most of the co
 - Sharing Instagram reels/videos to Discord via the system share sheet
 - Sharing local video files from Gallery / Files to Discord with automatic 20MB compression
 - Headless mode — share from Instagram or Gallery and never see the app UI
-- Temp files auto-deleted ~2 hours after sharing (kept until then so uploads can finish)
+- Shared files go through the system media store (`Movies/InstaEmbed`) so Discord can finish uploading even after Android freezes InstaEmbed in the background; they're auto-deleted ~2 hours later
+- Compression runs in a foreground service, so locking the phone or switching apps doesn't pause it
 - On-device video compression (MediaCodec) for files over Discord's free upload limit (20MB)
 - Automatic splitting of long videos into multiple <20MB parts, shared one at a time
 - H.265 (HEVC) or H.264 output, selectable in Settings
@@ -56,7 +57,6 @@ This was a fun project built in a day to scratch a personal itch. Most of the co
 
 - **Public posts only** — private/restricted accounts won't work
 - **H.265 playback on Linux** — some Linux Discord desktop setups can't decode HEVC; turn off **Use H.265** in Settings if friends can't play your clips
-- **Background freezing** — long compressions can be paused by Samsung's background app freezer if you lock the phone or switch apps mid-compression
 
 ### Future Improvements
 - iOS support
