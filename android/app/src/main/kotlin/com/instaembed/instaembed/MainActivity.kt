@@ -17,6 +17,7 @@ import java.io.FileOutputStream
 class MainActivity : FlutterActivity() {
     private val UPDATER_CHANNEL = "instaembed/updater"
     private val COMPRESSOR_CHANNEL = "instaembed/compressor"
+    private val SETTINGS_CHANNEL = "instaembed/settings"
 
     companion object {
         private const val REQUEST_PICK_VIDEO = 2002
@@ -122,6 +123,23 @@ class MainActivity : FlutterActivity() {
             }
         }
 
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, SETTINGS_CHANNEL).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "getSettings" -> result.success(AppSettings.toMap(this))
+                "setBool" -> {
+                    val key = call.argument<String>("key")
+                    val value = call.argument<Boolean>("value")
+                    if (key == null || value == null) {
+                        result.error("INVALID_ARGS", "key and value are required", null)
+                    } else {
+                        AppSettings.setBoolean(this, key, value)
+                        result.success(null)
+                    }
+                }
+                else -> result.notImplemented()
+            }
+        }
+
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, COMPRESSOR_CHANNEL).setMethodCallHandler { call, result ->
             when (call.method) {
                 "compressVideo" -> {
@@ -138,7 +156,10 @@ class MainActivity : FlutterActivity() {
                         try {
                             val inputFile = File(inputPath)
                             val outputFile = File(cacheDir, "instaembed_${shortcode}_compressed.mp4")
-                            val success = VideoCompressor.compress(inputFile, outputFile, targetSizeBytes)
+                            val success = VideoCompressor.compress(
+                                inputFile, outputFile, targetSizeBytes,
+                                videoMime = AppSettings.videoMime(this)
+                            )
                             runOnUiThread {
                                 if (success && outputFile.exists() && outputFile.length() > 0) {
                                     result.success(mapOf(

@@ -54,6 +54,9 @@
             android:excludeFromRecents="true"
             android:taskAffinity=""
             android:launchMode="singleTop" />
+        <receiver
+            android:name=".ShareTargetReceiver"
+            android:exported="false" />
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"

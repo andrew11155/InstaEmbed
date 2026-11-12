@@ -11,14 +11,37 @@ class SettingsScreen extends StatefulWidget {
 
 class _SettingsScreenState extends State<SettingsScreen> {
   static const _updaterChannel = MethodChannel('instaembed/updater');
+  static const _settingsChannel = MethodChannel('instaembed/settings');
 
   String _version = '';
   bool _checkingForUpdate = false;
+  bool _splitLongVideos = true;
+  bool _useHevc = true;
+  bool _hevcSupported = true;
 
   @override
   void initState() {
     super.initState();
     _loadVersion();
+    _loadSettings();
+  }
+
+  Future<void> _loadSettings() async {
+    try {
+      final result = await _settingsChannel.invokeMethod<Map<Object?, Object?>>('getSettings');
+      if (result == null || !mounted) return;
+      setState(() {
+        _splitLongVideos = result['split_long_videos'] as bool? ?? true;
+        _useHevc = result['use_hevc'] as bool? ?? true;
+        _hevcSupported = result['hevc_supported'] as bool? ?? false;
+      });
+    } catch (_) {}
+  }
+
+  Future<void> _setBool(String key, bool value) async {
+    try {
+      await _settingsChannel.invokeMethod('setBool', {'key': key, 'value': value});
+    } catch (_) {}
   }
 
   Future<void> _loadVersion() async {
@@ -81,6 +104,35 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ),
           ),
           const SizedBox(height: 32),
+          const Divider(),
+          SwitchListTile(
+            secondary: const Icon(Icons.content_cut),
+            title: const Text('Split long videos'),
+            subtitle: const Text(
+              'Videos too long to look good in one 20MB file are split into parts and shared one at a time',
+            ),
+            value: _splitLongVideos,
+            onChanged: (value) {
+              setState(() => _splitLongVideos = value);
+              _setBool('split_long_videos', value);
+            },
+          ),
+          SwitchListTile(
+            secondary: const Icon(Icons.high_quality),
+            title: const Text('Use H.265 (HEVC)'),
+            subtitle: Text(
+              _hevcSupported
+                  ? 'Sharper video at the same size. Turn off if a friend can\'t play your clips'
+                  : 'Not supported on this device — using H.264',
+            ),
+            value: _useHevc && _hevcSupported,
+            onChanged: _hevcSupported
+                ? (value) {
+                    setState(() => _useHevc = value);
+                    _setBool('use_hevc', value);
+                  }
+                : null,
+          ),
           const Divider(),
           ListTile(
             leading: const Icon(Icons.info_outline),

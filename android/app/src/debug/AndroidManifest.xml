@@ -4,4 +4,11 @@
          to allow setting breakpoints, to provide hot reload, etc.
     -->
     <uses-permission android:name="android.permission.INTERNET"/>
+    <application>
+        <!-- Debug-only hook (foreground so long encodes are not killed) for exercising VideoCompressor from adb -->
+        <activity
+            android:name=".CompressTestActivity"
+            android:theme="@style/ShareTheme"
+            android:exported="true" />
+    </application>
 </manifest>

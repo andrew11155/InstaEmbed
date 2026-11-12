@@ -3,6 +3,7 @@ package com.instaembed.instaembed
 import android.app.Activity
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.ClipData
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -30,18 +31,27 @@ class ShareActivity : Activity() {
     private val NOTIFICATION_ID = 1001
     private val handler = Handler(Looper.getMainLooper())
     private var shareLaunched = false
-    private var pendingCleanupFiles = mutableListOf<File>()
+    // Remaining parts of a split video, shared one at a time
+    private val partQueue = ArrayDeque<File>()
+    private var partTotal = 0
+    private var continueParts = false
 
     private val USER_AGENT =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
     private val IG_APP_ID = "936619743392459"
-    private val GRAPHQL_ENDPOINT = "https://www.instagram.com/graphql/query/"
+    // Instagram 401s logged-out requests to /graphql/query/ since Oct 2026; /api/graphql still
+    // works when it carries the page's LSD token
+    private val GRAPHQL_ENDPOINT = "https://www.instagram.com/api/graphql"
     private val DOC_ID = "27128499623469141"
 
     companion object {
         const val DISCORD_MAX_BYTES = 20L * 1024 * 1024 // 20 MB max Discord free limit
         const val COMPRESSION_THRESHOLD_BYTES = 19L * 1024 * 1024 // Compress if > 19 MB
         const val TARGET_COMPRESSED_BYTES = 18L * 1024 * 1024 // Aim for ~18 MB
+        const val ACTION_NEXT_PART = "com.instaembed.instaembed.NEXT_PART"
+        private const val PART_NOTIFICATION_ID = 1002
+        // Temp files older than this are leftovers from shares we never got to clean up
+        private const val STALE_TEMP_FILE_MS = 2L * 60 * 60 * 1000
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -63,6 +73,12 @@ class ShareActivity : Activity() {
 
         val action = intent.action
         val type = intent.type
+
+        // Tapped "share next part" notification; onResume picks it up
+        if (action == ACTION_NEXT_PART) {
+            continueParts = true
+            return
+        }
 
         // 1. Check for multiple video URIs (ACTION_SEND_MULTIPLE)
         if (action == Intent.ACTION_SEND_MULTIPLE) {
@@ -114,7 +130,21 @@ class ShareActivity : Activity() {
         finish()
     }
 
+    /**
+     * Shared files have to outlive the share itself (the receiving app may still be uploading
+     * from them), so they are only removed once they are a couple of hours old.
+     */
+    private fun deleteStaleTempFiles() {
+        val cutoff = System.currentTimeMillis() - STALE_TEMP_FILE_MS
+        cacheDir.listFiles()?.forEach { f ->
+            if (f.isFile && f.name.startsWith("instaembed_") && f.lastModified() < cutoff) {
+                f.delete()
+            }
+        }
+    }
+
     private fun startNotificationAndUpdates() {
+        Thread { deleteStaleTempFiles() }.start()
         if (checkSelfPermission("android.permission.POST_NOTIFICATIONS") == PackageManager.PERMISSION_GRANTED) {
             createNotificationChannel()
             showNotification("Preparing video...")
@@ -124,13 +154,18 @@ class ShareActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        if (shareLaunched) {
+        if (shareLaunched || continueParts) {
             shareLaunched = false
-            handler.postDelayed({
-                for (f in pendingCleanupFiles) f.delete()
-                pendingCleanupFiles.clear()
-                finish()
-            }, 10000)
+            continueParts = false
+            if (partQueue.isNotEmpty()) {
+                handler.postDelayed({ shareNextPart() }, 600)
+                return
+            }
+            dismissPartNotification()
+            // Shared files are NOT deleted here: Discord keeps uploading from our content URI in
+            // the background after the user is back, and deleting mid-upload left it stuck on
+            // "sending" forever. deleteStaleTempFiles() removes them hours later instead.
+            handler.postDelayed({ finish() }, 10000)
         }
     }
 
@@ -138,8 +173,8 @@ class ShareActivity : Activity() {
         try {
             updateNotification("Fetching post data...")
 
-            val csrfToken = fetchCsrfToken()
-            val postData = fetchGraphQL(shortcode, csrfToken)
+            val session = fetchSession()
+            val postData = fetchGraphQL(shortcode, session)
             if (postData == null) {
                 Log.e(TAG, "GraphQL returned null")
                 cleanupAndFinish()
@@ -150,7 +185,7 @@ class ShareActivity : Activity() {
             val isVideo = postData.second
 
             updateNotification("Downloading video...")
-            val tempFile = downloadFile(mediaUrl, shortcode)
+            val tempFile = downloadFile(mediaUrl, shortcode, if (isVideo) "mp4" else "jpg")
             if (tempFile == null) {
                 Log.e(TAG, "Download returned null")
                 cleanupAndFinish()
@@ -160,22 +195,18 @@ class ShareActivity : Activity() {
             Log.i(TAG, "Downloaded ${tempFile.length()} bytes to ${tempFile.path}")
 
             var fileToShare = tempFile
-            if (isVideo && tempFile.length() > COMPRESSION_THRESHOLD_BYTES) {
-                updateNotification("Compressing video for Discord (<20MB)...")
-                val compressed = compressVideo(tempFile, shortcode)
-                if (compressed != null && compressed.exists() && compressed.length() > 0) {
-                    fileToShare = compressed
-                    Log.i(TAG, "Compressed video to ${compressed.length()} bytes")
-                } else {
-                    Log.w(TAG, "Compression failed or did not reduce size")
-                    if (tempFile.length() > DISCORD_MAX_BYTES) {
-                        Log.e(TAG, "Video is ${tempFile.length()} bytes (> 20MB) and compression failed; aborting share")
-                        showToast("Failed to compress video to under Discord's 20MB limit.")
-                        tempFile.delete()
-                        cleanupAndFinish()
-                        return
-                    }
+            if (isVideo) {
+                val prepared = prepareVideo(tempFile, shortcode, allowSplit = true)
+                if (prepared == null) {
+                    tempFile.delete()
+                    cleanupAndFinish()
+                    return
                 }
+                if (prepared.size > 1) {
+                    startPartShares(prepared)
+                    return
+                }
+                fileToShare = prepared[0]
             }
 
             val mimeType = if (isVideo) "video/mp4" else "image/jpeg"
@@ -195,11 +226,9 @@ class ShareActivity : Activity() {
 
             dismissNotification()
 
-            pendingCleanupFiles.add(tempFile)
-            if (fileToShare != tempFile) pendingCleanupFiles.add(fileToShare)
 
             shareLaunched = true
-            startActivity(Intent.createChooser(shareIntent, null))
+            launchChooser(shareIntent, listOf(uri))
 
         } catch (e: Exception) {
             Log.e(TAG, "processShare failed: ${e.message}", e)
@@ -237,24 +266,17 @@ class ShareActivity : Activity() {
 
             Log.i(TAG, "Received video: ${tempFile.length()} bytes to ${tempFile.path}")
 
-            var fileToShare = tempFile
-            if (tempFile.length() > COMPRESSION_THRESHOLD_BYTES) {
-                updateNotification("Compressing video for Discord (<20MB)...")
-                val compressed = compressVideo(tempFile, "shared_${timestamp}")
-                if (compressed != null && compressed.exists() && compressed.length() > 0) {
-                    fileToShare = compressed
-                    Log.i(TAG, "Compressed video to ${compressed.length()} bytes")
-                } else {
-                    Log.w(TAG, "Compression failed or did not reduce size")
-                    if (tempFile.length() > DISCORD_MAX_BYTES) {
-                        Log.e(TAG, "Video is ${tempFile.length()} bytes (> 20MB) and compression failed; aborting share")
-                        showToast("Failed to compress video to under Discord's 20MB limit.")
-                        tempFile.delete()
-                        cleanupAndFinish()
-                        return
-                    }
-                }
+            val prepared = prepareVideo(tempFile, "shared_${timestamp}", allowSplit = true)
+            if (prepared == null) {
+                tempFile.delete()
+                cleanupAndFinish()
+                return
             }
+            if (prepared.size > 1) {
+                startPartShares(prepared)
+                return
+            }
+            val fileToShare = prepared[0]
 
             val shareUri = FileProvider.getUriForFile(
                 this,
@@ -272,11 +294,8 @@ class ShareActivity : Activity() {
 
             dismissNotification()
 
-            pendingCleanupFiles.add(tempFile)
-            if (fileToShare != tempFile) pendingCleanupFiles.add(fileToShare)
-
             shareLaunched = true
-            startActivity(Intent.createChooser(shareIntent, null))
+            launchChooser(shareIntent, listOf(shareUri))
 
         } catch (e: Exception) {
             Log.e(TAG, "processVideoShare failed: ${e.message}", e)
@@ -314,24 +333,12 @@ class ShareActivity : Activity() {
                     continue
                 }
 
-                pendingCleanupFiles.add(tempFile)
-
-                var targetFile = tempFile
-                if (tempFile.length() > COMPRESSION_THRESHOLD_BYTES) {
-                    updateNotification("Compressing video $fileNum of $total (<20MB)...")
-                    val compressed = compressVideo(tempFile, "shared_${timestamp}_$index")
-                    if (compressed != null && compressed.exists() && compressed.length() > 0) {
-                        targetFile = compressed
-                        pendingCleanupFiles.add(compressed)
-                        Log.i(TAG, "Compressed video $fileNum to ${compressed.length()} bytes")
-                    } else {
-                        Log.w(TAG, "Compression failed for video $fileNum")
-                        if (tempFile.length() > DISCORD_MAX_BYTES) {
-                            Log.e(TAG, "Video $fileNum is ${tempFile.length()} bytes (> 20MB) and compression failed; skipping")
-                            continue
-                        }
-                    }
-                }
+                // Several videos already go out in one message, so don't split these further
+                val prepared = prepareVideo(
+                    tempFile, "shared_${timestamp}_$index", allowSplit = false,
+                    label = "video $fileNum of $total", quiet = true
+                ) ?: continue
+                val targetFile = prepared[0]
                 filesToShare.add(targetFile)
             }
 
@@ -368,7 +375,7 @@ class ShareActivity : Activity() {
 
             dismissNotification()
             shareLaunched = true
-            startActivity(Intent.createChooser(shareIntent, null))
+            launchChooser(shareIntent, shareUris)
 
         } catch (e: Exception) {
             Log.e(TAG, "processMultipleVideos failed: ${e.message}", e)
@@ -396,6 +403,21 @@ class ShareActivity : Activity() {
             }
         }
         return uri.lastPathSegment
+    }
+
+    /**
+     * Opens the share sheet for [uris]. Once the user picks an app, [ShareTargetReceiver] grants
+     * that app lasting read access so a background upload survives this activity finishing.
+     */
+    private fun launchChooser(shareIntent: Intent, uris: List<Uri>, title: String? = null) {
+        val callback = Intent(this, ShareTargetReceiver::class.java)
+            .putParcelableArrayListExtra(ShareTargetReceiver.EXTRA_URIS, ArrayList(uris))
+        // Mutable so the system can add EXTRA_CHOSEN_COMPONENT; unique request code per share
+        val pending = PendingIntent.getBroadcast(
+            this, (System.currentTimeMillis() and 0x7fffffff).toInt(), callback,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
+        )
+        startActivity(Intent.createChooser(shareIntent, title, pending.intentSender))
     }
 
     private fun cleanupAndFinish() {
@@ -451,44 +473,64 @@ class ShareActivity : Activity() {
         } catch (_: Exception) {}
     }
 
-    private fun fetchCsrfToken(): String? {
+    /** Tokens scraped from the Instagram homepage that logged-out GraphQL requests need. */
+    private data class IgSession(val csrfToken: String?, val lsd: String?, val cookies: String)
+
+    /** Loads instagram.com like a browser navigation to collect its cookies and the LSD token. */
+    private fun fetchSession(): IgSession? {
         try {
             val conn = URL("https://www.instagram.com/").openConnection() as HttpURLConnection
             conn.setRequestProperty("User-Agent", USER_AGENT)
+            conn.setRequestProperty("Accept", "text/html")
+            conn.setRequestProperty("Sec-Fetch-Dest", "document")
+            conn.setRequestProperty("Sec-Fetch-Mode", "navigate")
+            conn.setRequestProperty("Sec-Fetch-Site", "none")
+            conn.instanceFollowRedirects = false
             conn.connectTimeout = 10000
             conn.readTimeout = 10000
-            conn.connect()
 
-            val cookieHeader = conn.headerFields
+            val setCookies = conn.headerFields
                 .filter { it.key?.equals("Set-Cookie", ignoreCase = true) == true }
                 .flatMap { it.value }
+            val cookies = setCookies.map { it.substringBefore(';') }.filter { it.contains('=') }
+            val csrfToken = cookies.firstOrNull { it.startsWith("csrftoken=") }?.substringAfter('=')
 
-            for (cookie in cookieHeader) {
-                val match = Regex("csrftoken=([^;]+)").find(cookie)
-                if (match != null) return match.groupValues[1]
-            }
-            return null
+            val html = (if (conn.responseCode < 400) conn.inputStream else conn.errorStream)
+                ?.bufferedReader()?.use { it.readText() } ?: ""
+            val lsd = Regex("\"LSD\",\\[\\],\\{[^{}]*\"token\":\"([^\"]+)\"").find(html)?.groupValues?.get(1)
+            if (lsd == null) Log.w(TAG, "fetchSession: no LSD token in homepage")
+
+            return IgSession(csrfToken, lsd, cookies.joinToString("; "))
         } catch (e: Exception) {
-            Log.e(TAG, "fetchCsrfToken failed: ${e.message}")
+            Log.e(TAG, "fetchSession failed: ${e.message}")
             return null
         }
     }
 
-    private fun fetchGraphQL(shortcode: String, csrfToken: String?): Pair<String, Boolean>? {
+    private fun fetchGraphQL(shortcode: String, session: IgSession?): Pair<String, Boolean>? {
         try {
             val variables = JSONObject().apply {
                 put("shortcode", shortcode)
                 put("__relay_internal__pv__PolarisAIGMMediaWebLabelEnabledrelayprovider", false)
             }
 
-            val body = "doc_id=$DOC_ID&variables=${URLEncoder.encode(variables.toString(), "UTF-8")}"
+            val lsd = session?.lsd
+            val body = (if (lsd != null) "lsd=${URLEncoder.encode(lsd, "UTF-8")}&" else "") +
+                "doc_id=$DOC_ID&variables=${URLEncoder.encode(variables.toString(), "UTF-8")}"
 
             val conn = URL(GRAPHQL_ENDPOINT).openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.setRequestProperty("User-Agent", USER_AGENT)
             conn.setRequestProperty("X-IG-App-ID", IG_APP_ID)
             conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
-            if (csrfToken != null) conn.setRequestProperty("X-CSRFToken", csrfToken)
+            session?.csrfToken?.let { conn.setRequestProperty("X-CSRFToken", it) }
+            if (lsd != null) conn.setRequestProperty("X-FB-LSD", lsd)
+            if (!session?.cookies.isNullOrEmpty()) conn.setRequestProperty("Cookie", session!!.cookies)
+            conn.setRequestProperty("Origin", "https://www.instagram.com")
+            conn.setRequestProperty("Referer", "https://www.instagram.com/p/$shortcode/")
+            conn.setRequestProperty("Sec-Fetch-Site", "same-origin")
+            conn.setRequestProperty("Sec-Fetch-Mode", "cors")
+            conn.setRequestProperty("Sec-Fetch-Dest", "empty")
             conn.doOutput = true
             conn.connectTimeout = 15000
             conn.readTimeout = 15000
@@ -533,7 +575,7 @@ class ShareActivity : Activity() {
         }
     }
 
-    private fun downloadFile(url: String, shortcode: String): File? {
+    private fun downloadFile(url: String, shortcode: String, extension: String): File? {
         try {
             val conn = URL(url).openConnection() as HttpURLConnection
             conn.setRequestProperty("User-Agent", USER_AGENT)
@@ -545,7 +587,9 @@ class ShareActivity : Activity() {
                 return null
             }
 
-            val file = File(cacheDir, "instaembed_$shortcode.mp4")
+            // Unique per share: reusing a name gives the same content URI, and Discord can confuse
+            // it with an earlier upload of that URI
+            val file = File(cacheDir, "instaembed_${shortcode}_${System.currentTimeMillis()}.$extension")
             conn.inputStream.use { input ->
                 FileOutputStream(file).use { output ->
                     input.copyTo(output)
@@ -558,19 +602,116 @@ class ShareActivity : Activity() {
         }
     }
 
-    private fun compressVideo(input: File, shortcode: String): File? {
-        try {
-            val output = File(cacheDir, "instaembed_${shortcode}_compressed.mp4")
-            val success = VideoCompressor.compress(input, output, TARGET_COMPRESSED_BYTES)
-            if (success && output.exists() && output.length() > 0) {
-                return output
-            }
-            output.delete()
-            return null
-        } catch (e: Exception) {
-            Log.e(TAG, "compressVideo failed: ${e.message}", e)
-            return null
+    /**
+     * Returns the file(s) to share for [input]: the original if it is already small enough,
+     * one compressed file, or several parts when the video is too long to look decent in one.
+     * Returns null (after telling the user) when it can't be made to fit.
+     */
+    private fun prepareVideo(
+        input: File,
+        baseName: String,
+        allowSplit: Boolean,
+        label: String = "video",
+        quiet: Boolean = false
+    ): List<File>? {
+        if (input.length() <= COMPRESSION_THRESHOLD_BYTES) return listOf(input)
+
+        val mime = AppSettings.videoMime(this)
+        val ranges = if (allowSplit && AppSettings.splitLongVideos(this)) {
+            VideoCompressor.planParts(VideoCompressor.probeDurationUs(input), TARGET_COMPRESSED_BYTES, mime)
+        } else {
+            listOf(VideoCompressor.TimeRange(0, -1))
         }
+
+        val stamp = System.currentTimeMillis()
+        val outputs = mutableListOf<File>()
+        for ((i, range) in ranges.withIndex()) {
+            val output = if (ranges.size == 1) {
+                updateNotification("Compressing $label for Discord (<20MB)...")
+                File(cacheDir, "instaembed_${baseName}_${stamp}_compressed.mp4")
+            } else {
+                updateNotification("Compressing part ${i + 1} of ${ranges.size}...")
+                File(cacheDir, "instaembed_${baseName}_${stamp}_part${i + 1}of${ranges.size}.mp4")
+            }
+            val ok = try {
+                VideoCompressor.compress(input, output, TARGET_COMPRESSED_BYTES, range.startUs, range.endUs, mime)
+            } catch (e: Exception) {
+                Log.e(TAG, "compress failed: ${e.message}", e)
+                false
+            }
+            if (!ok) {
+                output.delete()
+                outputs.forEach { it.delete() }
+                if (ranges.size == 1 && input.length() <= DISCORD_MAX_BYTES) {
+                    Log.w(TAG, "Compression failed but original fits; sharing original")
+                    return listOf(input)
+                }
+                Log.e(TAG, "Compression failed for $label (${input.length()} bytes)")
+                if (!quiet) showToast("Failed to compress video to under Discord's 20MB limit.")
+                return null
+            }
+            Log.i(TAG, "Compressed ${output.name} to ${output.length()} bytes")
+            outputs.add(output)
+        }
+        return outputs
+    }
+
+    private fun startPartShares(parts: List<File>) {
+        partQueue.clear()
+        partQueue.addAll(parts)
+        partTotal = parts.size
+        dismissNotification()
+        handler.post { shareNextPart() }
+    }
+
+    /** Opens the share sheet for the next queued part; the rest follow as the user returns. */
+    private fun shareNextPart() {
+        val part = partQueue.removeFirstOrNull() ?: return
+        val partNum = partTotal - partQueue.size
+        val uri = FileProvider.getUriForFile(this, "${packageName}.fileprovider", part)
+        val shareIntent = Intent(Intent.ACTION_SEND).apply {
+            type = "video/mp4"
+            putExtra(Intent.EXTRA_STREAM, uri)
+            clipData = ClipData.newRawUri(null, uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        if (partQueue.isNotEmpty()) {
+            showPartNotification(partNum + 1)
+        } else {
+            dismissPartNotification()
+        }
+        showToast("Sharing part $partNum of $partTotal")
+        shareLaunched = true
+        launchChooser(shareIntent, listOf(uri), "Share part $partNum of $partTotal")
+    }
+
+    private fun showPartNotification(nextPart: Int) {
+        try {
+            createNotificationChannel()
+            val intent = Intent(this, ShareActivity::class.java).apply {
+                action = ACTION_NEXT_PART
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            }
+            val pending = PendingIntent.getActivity(
+                this, 0, intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.ic_menu_share)
+                .setContentTitle("InstaEmbed")
+                .setContentText("Tap to share part $nextPart of $partTotal")
+                .setContentIntent(pending)
+                .setAutoCancel(true)
+                .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+                .build()
+            getSystemService(NotificationManager::class.java).notify(PART_NOTIFICATION_ID, notification)
+        } catch (_: Exception) {}
+    }
+
+    private fun dismissPartNotification() {
+        try {
+            getSystemService(NotificationManager::class.java).cancel(PART_NOTIFICATION_ID)
+        } catch (_: Exception) {}
     }
 
     private fun extractShortcode(url: String): String? {
