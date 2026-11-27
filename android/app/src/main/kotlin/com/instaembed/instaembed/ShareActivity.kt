@@ -174,10 +174,12 @@ class ShareActivity : Activity() {
         try {
             updateNotification("Fetching post data...")
 
-            val session = fetchSession()
-            val postData = fetchGraphQL(shortcode, session)
+            // The post page is the primary source: logged-out GraphQL calls hit "Rate limit
+            // exceeded" (Nov 2026) while the page itself still embeds the media URLs
+            val postData = fetchFromPage(shortcode) ?: fetchGraphQL(shortcode, fetchSession())
             if (postData == null) {
-                Log.e(TAG, "GraphQL returned null")
+                Log.e(TAG, "Could not get media for $shortcode")
+                showToast("Couldn't get that post from Instagram. Try again in a bit.")
                 cleanupAndFinish()
                 return
             }
@@ -464,6 +466,39 @@ class ShareActivity : Activity() {
         }
     }
 
+    /** Pulls the media URL out of the JSON Instagram inlines into the post page's HTML. */
+    private fun fetchFromPage(shortcode: String): Pair<String, Boolean>? {
+        try {
+            val conn = URL("https://www.instagram.com/p/$shortcode/").openConnection() as HttpURLConnection
+            conn.setRequestProperty("User-Agent", USER_AGENT)
+            conn.setRequestProperty("Accept", "text/html")
+            conn.setRequestProperty("Sec-Fetch-Dest", "document")
+            conn.setRequestProperty("Sec-Fetch-Mode", "navigate")
+            conn.setRequestProperty("Sec-Fetch-Site", "none")
+            conn.connectTimeout = 15000
+            conn.readTimeout = 15000
+            if (conn.responseCode != 200) {
+                Log.w(TAG, "fetchFromPage: page returned ${conn.responseCode}")
+                return null
+            }
+            val html = conn.inputStream.bufferedReader().use { it.readText() }
+            val str = "\"((?:[^\"\\\\]|\\\\.)*)\""
+            Regex("\"video_versions\":\\[\\{[^\\]]*?\"url\":$str").find(html)?.let {
+                return Pair(unescapeJson(it.groupValues[1]), true)
+            }
+            Regex("\"image_versions2\":\\{\"candidates\":\\[\\{[^\\]]*?\"url\":$str").find(html)?.let {
+                return Pair(unescapeJson(it.groupValues[1]), false)
+            }
+            Log.w(TAG, "fetchFromPage: no media in page for $shortcode")
+            return null
+        } catch (e: Exception) {
+            Log.e(TAG, "fetchFromPage failed: ${e.message}")
+            return null
+        }
+    }
+
+    private fun unescapeJson(raw: String): String = org.json.JSONArray("[\"$raw\"]").getString(0)
+
     private fun fetchGraphQL(shortcode: String, session: IgSession?): Pair<String, Boolean>? {
         try {
             val variables = JSONObject().apply {
@@ -501,6 +536,10 @@ class ShareActivity : Activity() {
 
             val response = conn.inputStream.bufferedReader().use { it.readText() }
             val json = JSONObject(response)
+            if (!json.has("data") || json.isNull("data")) {
+                Log.e(TAG, "GraphQL response has no data: ${response.take(1000)}")
+                return null
+            }
             val items = json
                 .getJSONObject("data")
                 .getJSONObject("xdt_api__v1__media__shortcode__web_info")

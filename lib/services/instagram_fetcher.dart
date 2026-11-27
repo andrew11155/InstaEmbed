@@ -53,11 +53,58 @@ class InstagramFetcher {
     }
   }
 
+  static final _jsonStr = r'"((?:[^"\\]|\\.)*)"';
+
+  static String? _find(String html, String prefix) {
+    final m = RegExp(prefix + _jsonStr).firstMatch(html);
+    return m == null ? null : jsonDecode('"${m.group(1)}"') as String;
+  }
+
+  /// Reads the media JSON that Instagram inlines into the post page's HTML. Logged-out GraphQL
+  /// calls hit "Rate limit exceeded" (Nov 2026) while the page still embeds the media URLs.
+  static Future<PostData?> _fetchFromPage(String shortcode) async {
+    try {
+      final response = await http.get(
+        Uri.parse('https://www.instagram.com/p/$shortcode/'),
+        headers: {
+          'User-Agent': _userAgent,
+          'Accept': 'text/html',
+          'Sec-Fetch-Dest': 'document',
+          'Sec-Fetch-Mode': 'navigate',
+          'Sec-Fetch-Site': 'none',
+        },
+      );
+      if (response.statusCode != 200) return null;
+      final html = response.body;
+      final videoUrl = _find(html, r'"video_versions":\[\{[^\]]*?"url":');
+      final imageUrl = _find(html, r'"image_versions2":\{"candidates":\[\{[^\]]*?"url":') ??
+          RegExp(r'<meta property="og:image" content="([^"]+)"')
+              .firstMatch(html)
+              ?.group(1)
+              ?.replaceAll('&amp;', '&');
+      if (videoUrl == null && imageUrl == null) return null;
+      return PostData(
+        shortcode: shortcode,
+        videoUrl: videoUrl,
+        imageUrl: imageUrl,
+        caption: _find(html, r'"caption":\{[^{}]*?"text":'),
+        authorUsername: _find(html, r'"user":\{[^{}]*?"username":'),
+        authorProfilePic: _find(html, r'"user":\{[^{}]*?"profile_pic_url":'),
+        likeCount: int.tryParse(RegExp(r'"like_count":(\d+)').firstMatch(html)?.group(1) ?? '') ?? 0,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
   static Future<PostData> fetchPost(String url) async {
     final shortcode = extractShortcode(url);
     if (shortcode == null) {
       throw Exception('Could not extract shortcode from URL');
     }
+
+    final fromPage = await _fetchFromPage(shortcode);
+    if (fromPage != null) return fromPage;
 
     final session = await _fetchSession();
 
@@ -92,6 +139,10 @@ class InstagramFetcher {
     }
 
     final data = jsonDecode(response.body);
+    if (data['data'] == null) {
+      final message = data['errors']?[0]?['message'];
+      throw Exception(message != null ? 'Instagram: $message. Try again in a bit.' : 'No media found in response');
+    }
     final items = data['data']?['xdt_api__v1__media__shortcode__web_info']?['items'];
     if (items == null || items.isEmpty) {
       throw Exception('No media found in response');
